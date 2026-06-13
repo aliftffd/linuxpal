@@ -51,6 +51,10 @@ An assistant should know your machine's state, not just the focused window.
 > During active PyTorch training (3–3.5GB VRAM used), disable phi4-mini entirely — pet runs
 > display-only mode.
 
+*Offline fallback:* ◐ done — when Ollama is unreachable (off / GPU busy training), the
+bubble shows a curated per-state tip + joke (`sprites::offline_tip` / `offline_joke`)
+instead of going blank. Two-model swap + intent routing still TODO.
+
 ### Two-model architecture
 
 ```
@@ -227,6 +231,9 @@ Move from talking to doing.
 - **Theming** — palette swaps, alternate sprite packs, day/night skins.
 - **Config file** — move the `const`s into `~/.config/linuxpal/config.toml`
   (states, timings, personality, HDMI name) so no rebuild needed.
+  *Status:* ✅ done — `config.rs` loads `hdmi_match`, `model`, `greet_msg`, and the
+  roam/idle/coffee timings; writes a commented default on first run. (App-class lists
+  still in code — could move to config later.)
 
 ---
 

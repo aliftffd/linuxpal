@@ -3,10 +3,6 @@ use std::process::Command;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-/// Substring (lowercased) identifying the screen that drives state on a
-/// dual-monitor setup. Change if your external display isn't an HDMI port.
-const HDMI_MATCH: &str = "hdmi";
-
 #[derive(Debug, Clone, PartialEq)]
 pub struct WindowContext {
     pub class: String,
@@ -26,9 +22,9 @@ impl WindowContext {
 /// Dual screen → the HDMI monitor's active-workspace window (stable, ignores
 /// focus bouncing to the other display). Single screen → the focused monitor's
 /// active window (workspace-based, as before).
-pub fn spawn_ipc_listener(ctx: Arc<Mutex<WindowContext>>) {
+pub fn spawn_ipc_listener(ctx: Arc<Mutex<WindowContext>>, hdmi_match: String) {
     std::thread::spawn(move || loop {
-        if let Some(new) = poll_context() {
+        if let Some(new) = poll_context(&hdmi_match) {
             if let Ok(mut c) = ctx.lock() {
                 if *c != new {
                     log::info!("ctx → class={} title={}", new.class, new.title);
@@ -40,7 +36,7 @@ pub fn spawn_ipc_listener(ctx: Arc<Mutex<WindowContext>>) {
     });
 }
 
-fn poll_context() -> Option<WindowContext> {
+fn poll_context(hdmi_match: &str) -> Option<WindowContext> {
     let monitors = hyprctl_json(&["-j", "monitors"])?;
     let mons = monitors.as_array()?;
 
@@ -61,7 +57,7 @@ fn poll_context() -> Option<WindowContext> {
             .find(|m| {
                 m["name"]
                     .as_str()
-                    .map(|n| n.to_lowercase().contains(HDMI_MATCH))
+                    .map(|n| n.to_lowercase().contains(hdmi_match))
                     .unwrap_or(false)
             })
             .copied()

@@ -184,81 +184,73 @@ impl Animator {
     }
 }
 
-pub struct TipBank {
-    tips: HashMap<String, Vec<&'static str>>,
-}
-
-impl TipBank {
-    pub fn new() -> Self {
-        let mut tips = HashMap::new();
-
-        tips.insert("working".into(), vec![
+/// Curated offline tip for a state, shown when the LLM (Ollama) is unreachable
+/// — it's off, or the GPU is busy training (IDEAS Phase 2.5 fallback). Rotates
+/// on a 5-second clock so it isn't static.
+pub fn offline_tip(state: &State) -> &'static str {
+    let list: &[&str] = match state {
+        State::Working | State::WorkingEmpty | State::TrainingDone => &[
             "try :Telescope find_files in nvim",
             "cargo check is faster than build",
             "use zoxide for fast dir jumping",
             "tmux prefix + z to zoom a pane",
             "rg is faster than grep, try it",
             "cargo clippy catches common bugs",
-        ]);
-
-        tips.insert("alert".into(), vec![
+        ],
+        State::Alert => &[
             "zen supports vertical tabs",
             "ctrl+l to focus the address bar",
             "use uBlock Origin filter lists",
             "middle click to close browser tabs",
-        ]);
-
-        tips.insert("thinking".into(), vec![
+        ],
+        State::Thinking => &[
             "try: man <command> for any tool",
             "use tldr for quick command refs",
             "apropos <keyword> finds commands",
             "info coreutils has detailed docs",
-        ]);
-
-        tips.insert("idle".into(), vec![
+        ],
+        State::Jamming => &[
+            "playerctl play-pause from any term",
+            "mpv --no-video plays audio only",
+            "spotify_player is a TUI client",
+            "ncspot is rust-native spotify TUI",
+        ],
+        State::Cozy => &[
+            "zathura: J/K scroll, gg jumps top",
+            "use foliate for epub reading",
+            "okular can annotate PDFs",
+            "sioyek is built for papers",
+        ],
+        _ => &[
             "hyprctl dispatch workspace 2",
             "try: hyprctl clients | grep class",
             "wofi --show run for app launcher",
             "super+shift+q to close a window",
             "hyprctl reload reloads config",
-        ]);
+        ],
+    };
+    rotate(list)
+}
 
-        tips.insert("jamming".into(), vec![
-            "playerctl play-pause from any term",
-            "mpv --no-video plays audio only",
-            "spotify_player is a TUI client",
-            "ncspot is rust-native spotify TUI",
-        ]);
+/// A rotating offline joke for the bubble's JOKE line.
+pub fn offline_joke() -> &'static str {
+    rotate(&[
+        "sudo make me a sandwich",
+        "why do devs hate nature? too many bugs",
+        "it works on my machine",
+        "99 little bugs in the code, take one down...",
+        "a SQL query walks into a bar, joins two tables",
+        "rm -rf my_doubts",
+    ])
+}
 
-        tips.insert("cozy".into(), vec![
-            "zathura: J/K scroll, gg jumps top",
-            "use foliate for epub reading",
-            "okular can annotate PDFs",
-            "sioyek is built for papers",
-        ]);
-
-        Self { tips }
-    }
-
-    pub fn get(&self, state: &State) -> &'static str {
-        let key = match state {
-            State::Working      => "working",
-            State::Alert        => "alert",
-            State::Thinking     => "thinking",
-            State::Happy        => "idle",
-            State::Idle         => "idle",
-            State::Jamming      => "jamming",
-            State::Cozy         => "cozy",
-            State::Curious      => "idle",
-            State::WorkingEmpty => "working",
-            State::TrainingDone => "working",
-            State::Walk(_)      => "idle",
-        };
-        let list = self.tips.get(key).unwrap();
-        let idx = (std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_secs() / 5) as usize % list.len();
-        list[idx]
-    }
+/// Pick from a list on a 5-second clock tick.
+fn rotate(list: &[&'static str]) -> &'static str {
+    let idx = (std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+        / 5) as usize
+        % list.len();
+    list[idx]
 }

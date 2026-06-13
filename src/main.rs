@@ -1,4 +1,5 @@
 mod bubble;
+mod config;
 mod context;
 mod control;
 mod ipc;
@@ -51,21 +52,15 @@ const SPRITE_H: u32 = 165;  // jamming is tallest at 155
 const MARGIN: i32 = 16;
 const TICK_HZ: u64 = 10;
 
-// behavior timers (ticks at TICK_HZ=10 → 100ms each)
-const CURIOUS_AFTER: u64 = 150;   // idle 15s with no window → curious
-const WALK_EVERY: u64 = 100;      // after 10s of a stable window, take a stroll
-const WALK_DURATION: u32 = 120;   // non-music roam length (12s), repick on arrival
-const WALK_STEP: i32 = 8;         // px moved per tick while walking
-const PARK_DURATION: u32 = 30;    // jam in place 3s on arrival (music roam)
-const COFFEE_AFTER: u64 = 1800;   // working 3min straight → out of coffee
+// behavior timers (CURIOUS_AFTER / WALK_EVERY / WALK_DURATION / WALK_STEP /
+// PARK_DURATION / COFFEE_AFTER) now live in config.toml — see config.rs.
 
 // free-roam bounds when no output geometry is known yet
 const FALLBACK_W: i32 = 1920;
 const FALLBACK_H: i32 = 1080;
 
 const WALL_PAD: i32 = 250; // let targets overshoot bounds so it bumps walls
-const GREET_TICKS: u32 = 80; // 8s welcome on launch
-const GREET_MSG: &str = "hello! lets get some ideas and tasks done!";
+const GREET_TICKS: u32 = 80; // 8s welcome on launch (greet text → config.greet_msg)
 // representative mascot width (sprites are 120–230); the mascot blits flush-right
 // in the SPRITE_W surface, so its visual centre is offset from the surface centre.
 const MASCOT_W: i32 = 188;
@@ -103,6 +98,8 @@ struct LinuxPal {
     layer_shell: LayerShell,
     shm: Shm,
     seat_state: SeatState,
+
+    cfg: config::Config,
 
     layer_surface: Option<LayerSurface>,
     pool: Option<SlotPool>,
@@ -172,7 +169,7 @@ struct LinuxPal {
 }
 
 impl LinuxPal {
-    fn draw(&mut self, qh: &QueueHandle<Self>) {
+    fn draw(&mut self, _qh: &QueueHandle<Self>) {
         let surface = match &self.layer_surface {
             Some(s) => s,
             None => return,
@@ -264,7 +261,8 @@ impl LinuxPal {
         // startup greeting — cheer with happy state for a few seconds
         if self.greet_ticks_left > 0 {
             if !self.greeted {
-                self.bubble.say(GREET_MSG);
+                let greet = self.cfg.greet_msg.clone();
+                self.bubble.say(&greet);
                 self.animator.state = State::Happy;
                 self.animator.reset();
                 self.greeted = true;
@@ -288,9 +286,9 @@ impl LinuxPal {
         }
 
         // snapshot what MPRIS is playing
-        let (pmusic, pvideo, ptitle, pplayer) = match self.player_state.lock() {
-            Ok(p) => (p.music, p.video, p.title.clone(), p.player.clone()),
-            Err(_) => (false, false, String::new(), String::new()),
+        let (pmusic, pvideo, ptitle) = match self.player_state.lock() {
+            Ok(p) => (p.music, p.video, p.title.clone()),
+            Err(_) => (false, false, String::new()),
         };
 
         // read window context → base state + prompt string + media scope.
@@ -303,7 +301,7 @@ impl LinuxPal {
                 } else {
                     format!("{} - {}", ctx.class, ctx.title)
                 };
-                (s, cs, context::media_applies(&ctx, &ptitle, &pplayer))
+                (s, cs, context::media_applies(&ctx, &ptitle))
             }
             Err(_) => return,
         };
@@ -345,7 +343,7 @@ impl LinuxPal {
 
         // priority: music-roam > jamming > video(cozy) > idle-roam > moods > base
         let roam_trigger =
-            self.stable_ticks >= WALK_EVERY && self.stable_ticks % WALK_EVERY == 0;
+            self.stable_ticks >= self.cfg.walk_every && self.stable_ticks % self.cfg.walk_every == 0;
         let idle_or_work = matches!(base, State::Idle | State::Working);
 
         let effective = if music && roam_trigger {
@@ -357,9 +355,9 @@ impl LinuxPal {
             State::Cozy
         } else if idle_or_work && roam_trigger {
             self.begin_roam(music)
-        } else if base == State::Idle && self.idle_ticks >= CURIOUS_AFTER {
+        } else if base == State::Idle && self.idle_ticks >= self.cfg.curious_after {
             State::Curious
-        } else if base == State::Working && self.working_ticks >= COFFEE_AFTER {
+        } else if base == State::Working && self.working_ticks >= self.cfg.coffee_after {
             State::WorkingEmpty
         } else {
             base
@@ -387,7 +385,7 @@ impl LinuxPal {
                 log::info!("state → {:?}", effective);
                 if !matches!(effective, State::Walk(_)) {
                     self.bubble.show_loading();
-                    llm::query_async(context_str, self.bubble_tx.clone());
+                    llm::query_async(context_str, effective.clone(), self.bubble_tx.clone());
                 }
                 self.animator.state = effective;
                 self.animator.reset();
@@ -660,7 +658,7 @@ impl LinuxPal {
         log::info!("roam start (stable {} ticks, music={music})", self.stable_ticks);
         self.roaming = true;
         self.park_ticks_left = 0;
-        self.walk_ticks_left = WALK_DURATION;
+        self.walk_ticks_left = self.cfg.walk_duration;
         self.pick_walk_target();
         State::Walk(self.walk_dir)
     }
@@ -683,14 +681,15 @@ impl LinuxPal {
             return;
         }
 
+        let walk_step = self.cfg.walk_step;
         let step_axis = |cur: i32, target: i32| -> i32 {
             let d = target - cur;
-            if d.abs() <= WALK_STEP {
+            if d.abs() <= walk_step {
                 target
             } else if d > 0 {
-                cur + WALK_STEP
+                cur + walk_step
             } else {
-                cur - WALK_STEP
+                cur - walk_step
             }
         };
 
@@ -738,7 +737,7 @@ impl LinuxPal {
         // arrived at the spot
         if self.pos_x == self.target_x && self.pos_y == self.target_y {
             if music {
-                self.park_ticks_left = PARK_DURATION;
+                self.park_ticks_left = self.cfg.park_duration;
                 self.animator.state = State::Jamming;
             } else {
                 self.pick_walk_target();
@@ -1117,6 +1116,10 @@ fn parse_state(name: &str) -> Option<State> {
 fn main() {
     env_logger::init();
 
+    // user config (~/.config/linuxpal/config.toml) — written with defaults on first run
+    let cfg = config::load();
+    llm::set_model(cfg.model.clone());
+
     let asset_dir =
         std::env::var("LINUXPAL_ASSETS").unwrap_or_else(|_| "assets/sprites".to_string());
 
@@ -1125,7 +1128,7 @@ fn main() {
 
     // shared window context — written by IPC thread, read by main loop
     let win_ctx = Arc::new(Mutex::new(WindowContext::empty()));
-    ipc::spawn_ipc_listener(Arc::clone(&win_ctx));
+    ipc::spawn_ipc_listener(Arc::clone(&win_ctx), cfg.hdmi_match.clone());
 
     // background MPRIS poller — exposes playing music/video + track title/url
     let player_state = Arc::new(Mutex::new(player::PlayerState::default()));
@@ -1162,6 +1165,7 @@ fn main() {
         registry_state: RegistryState::new(&globals),
         output_state: OutputState::new(&globals, &qh),
         seat_state: SeatState::new(&globals, &qh),
+        cfg,
         compositor,
         layer_shell,
         shm,

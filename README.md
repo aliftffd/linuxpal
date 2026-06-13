@@ -95,21 +95,26 @@ reload`.
 
 ## Configuration
 
-Tunables live as `const`s near the top of `src/main.rs`:
+Edit `~/.config/linuxpal/config.toml` (written with defaults on first run), then
+restart (`super+shift+P` twice). No rebuild needed.
 
-| Const | Meaning |
-|-------|---------|
-| `WALK_EVERY` | how often a roam starts (ticks; 10 = 1s) |
-| `WALK_DURATION` | length of a non-music roam |
-| `WALK_STEP` | px moved per tick |
-| `PARK_DURATION` | time spent dancing in place per spot while music plays |
-| `CURIOUS_AFTER` / `COFFEE_AFTER` | idle / working timeouts |
-| `GREET_MSG` | startup greeting text |
+| Key | Meaning |
+|-----|---------|
+| `hdmi_match` | substring of the monitor that decides state on dual screens (default `"hdmi"`) |
+| `model` | Ollama model for tips + ask (default `qwen2.5:1.5b`) |
+| `greet_msg` | startup greeting text |
+| `walk_every` | how often a roam starts (ticks; 10 = 1s) |
+| `walk_duration` | length of a non-music roam |
+| `walk_step` | px moved per tick |
+| `park_duration` | dance-in-place time per spot while music plays |
+| `curious_after` / `coffee_after` | idle / working timeouts |
 
-Other knobs:
-- `HDMI_MATCH` in `src/ipc.rs` — substring identifying the deciding monitor (default `"hdmi"`).
-- `LINUXPAL_ASSETS` env var — sprite directory.
+Env knobs:
+- `LINUXPAL_ASSETS` — sprite directory.
 - `RUST_LOG=info` — verbose logging.
+
+If Ollama is unreachable (off, or GPU busy training), the bubble falls back to a
+curated **offline tip/joke** bank per state instead of going blank.
 
 ---
 

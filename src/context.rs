@@ -16,36 +16,16 @@ fn is_player_app(class: &str) -> bool {
     )
 }
 
-fn is_terminal(class: &str) -> bool {
-    matches!(
-        class,
-        "kitty" | "alacritty" | "foot" | "wezterm" | "ghostty" | "st" | "xterm" | "konsole"
-    )
-}
-
-/// MPRIS player names for music TUIs that live *inside* a terminal — their
-/// window class is the terminal (`kitty`), so they can only be recognized by
-/// the player name MPRIS reports.
-fn is_tui_player(player: &str) -> bool {
-    matches!(
-        player,
-        "ncspot" | "cmus" | "spotify_player" | "spotifyd" | "mpd" | "moc" | "musikcube" | "mpv"
-    )
-}
-
 /// Should the playing media (jamming/cozy) drive state for THIS deciding window?
 /// - Dedicated players (own window) → yes.
 /// - Browsers are one MPRIS player across many tabs/screens, so require the
 ///   playing track title to match the window's shown title (stops a video on
 ///   another screen's tab from hijacking state).
-/// - A terminal whose music comes from a known TUI player (ncspot, cmus,
-///   spotify_player, …) → yes, even though the class is just the terminal.
-pub fn media_applies(ctx: &WindowContext, player_title: &str, player_name: &str) -> bool {
+/// Terminals are deliberately NOT here: focusing a terminal always means
+/// Working, even if a TUI music player is running in it.
+pub fn media_applies(ctx: &WindowContext, player_title: &str) -> bool {
     let class = ctx.class.as_str();
     if is_player_app(class) {
-        return true;
-    }
-    if is_terminal(class) && is_tui_player(player_name) {
         return true;
     }
     if is_browser(class) {
@@ -158,24 +138,16 @@ mod tests {
     }
 
     #[test]
-    fn terminal_tui_player_jams() {
-        // the bug fix: ncspot/cmus/spotify_player in a terminal → media applies
-        assert!(media_applies(&ctx("kitty", "ncspot"), "some song", "ncspot"));
-        assert!(media_applies(&ctx("alacritty", "tmux"), "track", "cmus"));
-        assert!(media_applies(&ctx("kitty", "tmux"), "x", "spotify_player"));
-    }
-
-    #[test]
-    fn terminal_without_tui_player_does_not_jam() {
-        // browser/desktop audio while a terminal is focused must NOT hijack it
-        assert!(!media_applies(&ctx("kitty", "tmux"), "ayo cek toco", "firefox"));
-        assert!(!media_applies(&ctx("kitty", "nvim"), "song", "spotify")); // desktop spotify
+    fn terminal_never_jams() {
+        // focusing a terminal is always Working, even with music playing
+        assert!(!media_applies(&ctx("kitty", "tmux"), "some song"));
+        assert!(!media_applies(&ctx("alacritty", "ncspot"), "track"));
     }
 
     #[test]
     fn dedicated_player_window_always_applies() {
-        assert!(media_applies(&ctx("spotify", "Artist - Song"), "", "spotify"));
-        assert!(media_applies(&ctx("mpv", "video.mkv"), "", "mpv"));
+        assert!(media_applies(&ctx("spotify", "Artist - Song"), ""));
+        assert!(media_applies(&ctx("mpv", "video.mkv"), ""));
     }
 
     #[test]
@@ -202,16 +174,8 @@ mod tests {
     #[test]
     fn browser_requires_title_match() {
         // playing tab is the focused one → applies
-        assert!(media_applies(
-            &ctx("zen", "my song - youtube"),
-            "my song",
-            "firefox"
-        ));
+        assert!(media_applies(&ctx("zen", "my song - youtube"), "my song"));
         // a different tab title → does not apply
-        assert!(!media_applies(
-            &ctx("zen", "github - pull request"),
-            "my song",
-            "firefox"
-        ));
+        assert!(!media_applies(&ctx("zen", "github - pull request"), "my song"));
     }
 }

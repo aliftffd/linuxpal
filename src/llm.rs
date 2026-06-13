@@ -1,8 +1,19 @@
 use std::io::BufRead;
 use std::sync::mpsc;
+use std::sync::OnceLock;
 
 const OLLAMA_URL: &str = "http://localhost:11434/api/generate";
-const MODEL: &str = "qwen2.5:1.5b";
+const DEFAULT_MODEL: &str = "qwen2.5:1.5b";
+static MODEL: OnceLock<String> = OnceLock::new();
+
+/// Set the Ollama model from config. Call once at startup.
+pub fn set_model(name: String) {
+    let _ = MODEL.set(name);
+}
+
+fn model() -> &'static str {
+    MODEL.get().map(String::as_str).unwrap_or(DEFAULT_MODEL)
+}
 
 /// A message destined for the bubble, produced asynchronously by the LLM.
 ///
@@ -21,22 +32,6 @@ pub enum BubbleUpdate {
 pub struct LlmResponse {
     pub tip:  String,
     pub joke: String,
-}
-
-impl LlmResponse {
-    pub fn loading() -> Self {
-        Self {
-            tip:  "thinking...".into(),
-            joke: "thinking...".into(),
-        }
-    }
-
-    pub fn fallback() -> Self {
-        Self {
-            tip:  "try: man <command>".into(),
-            joke: "why do devs hate nature? too many bugs".into(),
-        }
-    }
 }
 
 fn build_prompt(context: &str) -> String {
@@ -66,11 +61,18 @@ fn parse_response(raw: &str) -> LlmResponse {
     LlmResponse { tip, joke }
 }
 
-/// Ambient state tip — non-blocking, sends a `TipJoke` back via mpsc.
-pub fn query_async(context: String, tx: mpsc::Sender<BubbleUpdate>) {
+/// Ambient state tip — non-blocking. Sends a `TipJoke`; if Ollama is
+/// unreachable, falls back to the curated offline bank for `state`.
+pub fn query_async(context: String, state: crate::sprites::State, tx: mpsc::Sender<BubbleUpdate>) {
     std::thread::spawn(move || {
-        let r = query_blocking(&context);
-        let _ = tx.send(BubbleUpdate::TipJoke { tip: r.tip, joke: r.joke });
+        let update = match query_blocking(&context) {
+            Some(r) => BubbleUpdate::TipJoke { tip: r.tip, joke: r.joke },
+            None => BubbleUpdate::TipJoke {
+                tip: crate::sprites::offline_tip(&state).to_string(),
+                joke: crate::sprites::offline_joke().to_string(),
+            },
+        };
+        let _ = tx.send(update);
     });
 }
 
@@ -95,7 +97,7 @@ fn stream_ask(question: &str, tx: &mpsc::Sender<BubbleUpdate>) -> Result<(), Str
     );
 
     let body = serde_json::json!({
-        "model": MODEL,
+        "model": model(),
         "prompt": prompt,
         "stream": true,
         "options": {
@@ -151,11 +153,13 @@ fn stream_ask(question: &str, tx: &mpsc::Sender<BubbleUpdate>) -> Result<(), Str
     Ok(())
 }
 
-fn query_blocking(context: &str) -> LlmResponse {
+/// Query Ollama for a tip/joke. `None` on any failure (build / network / parse)
+/// so the caller can drop to the offline bank.
+fn query_blocking(context: &str) -> Option<LlmResponse> {
     let prompt = build_prompt(context);
 
     let body = serde_json::json!({
-        "model": MODEL,
+        "model": model(),
         "prompt": prompt,
         "stream": false,
         "options": {
@@ -164,35 +168,25 @@ fn query_blocking(context: &str) -> LlmResponse {
         }
     });
 
-    let client = match reqwest::blocking::Client::builder()
+    let client = reqwest::blocking::Client::builder()
         .timeout(std::time::Duration::from_secs(10))
         .build()
-    {
-        Ok(c) => c,
-        Err(e) => {
-            log::warn!("failed to build http client: {e}");
-            return LlmResponse::fallback();
-        }
-    };
+        .map_err(|e| log::warn!("failed to build http client: {e}"))
+        .ok()?;
 
-    match client.post(OLLAMA_URL).json(&body).send() {
-        Ok(resp) => match resp.json::<serde_json::Value>() {
-            Ok(json) => {
-                let raw = json["response"]
-                    .as_str()
-                    .unwrap_or("")
-                    .to_string();
-                log::info!("llm raw response: {raw}");
-                parse_response(&raw)
-            }
-            Err(e) => {
-                log::warn!("llm json parse error: {e}");
-                LlmResponse::fallback()
-            }
-        },
-        Err(e) => {
-            log::warn!("llm request failed (is ollama running?): {e}");
-            LlmResponse::fallback()
-        }
-    }
+    let resp = client
+        .post(OLLAMA_URL)
+        .json(&body)
+        .send()
+        .map_err(|e| log::warn!("llm request failed (is ollama running?): {e}"))
+        .ok()?;
+
+    let json = resp
+        .json::<serde_json::Value>()
+        .map_err(|e| log::warn!("llm json parse error: {e}"))
+        .ok()?;
+
+    let raw = json["response"].as_str().unwrap_or("").to_string();
+    log::info!("llm raw response: {}", raw.trim());
+    Some(parse_response(&raw))
 }
