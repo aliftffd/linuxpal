@@ -13,9 +13,11 @@ EXEC_LINE='exec-once = env LINUXPAL_ASSETS=$HOME/.local/share/linuxpal/sprites $
 echo "==> building release"
 cargo build --release --manifest-path "$REPO/Cargo.toml"
 
-echo "==> installing binary → $BIN_DIR"
+echo "==> installing binaries → $BIN_DIR"
 mkdir -p "$BIN_DIR"
 install -m755 "$REPO/target/release/linuxpal" "$BIN_DIR/linuxpal"
+install -m755 "$REPO/target/release/linuxpal-ctl" "$BIN_DIR/linuxpal-ctl"
+install -m755 "$REPO/linuxpal-toggle" "$BIN_DIR/linuxpal-toggle"
 
 echo "==> installing sprites → $ASSET_DIR"
 mkdir -p "$ASSET_DIR"

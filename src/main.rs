@@ -1,7 +1,10 @@
 mod bubble;
 mod context;
+mod control;
 mod ipc;
 mod llm;
+mod menu;
+mod morning;
 mod player;
 mod renderer;
 mod sprites;
@@ -12,12 +15,13 @@ use std::time::{Duration, Instant};
 
 use smithay_client_toolkit::{
     compositor::{CompositorHandler, CompositorState},
-    delegate_compositor, delegate_layer, delegate_output, delegate_pointer, delegate_registry,
-    delegate_seat, delegate_shm,
+    delegate_compositor, delegate_keyboard, delegate_layer, delegate_output, delegate_pointer,
+    delegate_registry, delegate_seat, delegate_shm,
     output::{OutputHandler, OutputState},
     registry::{ProvidesRegistryState, RegistryState},
     registry_handlers,
     seat::{
+        keyboard::{KeyEvent, KeyboardHandler},
         pointer::{PointerEvent, PointerEventKind, PointerHandler},
         Capability, SeatHandler, SeatState,
     },
@@ -35,7 +39,7 @@ use smithay_client_toolkit::{
 };
 use wayland_client::{
     globals::registry_queue_init,
-    protocol::{wl_output, wl_pointer, wl_seat, wl_shm, wl_surface},
+    protocol::{wl_keyboard, wl_output, wl_pointer, wl_seat, wl_shm, wl_surface},
     Connection, QueueHandle,
 };
 
@@ -62,6 +66,16 @@ const FALLBACK_H: i32 = 1080;
 const WALL_PAD: i32 = 250; // let targets overshoot bounds so it bumps walls
 const GREET_TICKS: u32 = 80; // 8s welcome on launch
 const GREET_MSG: &str = "hello! lets get some ideas and tasks done!";
+// representative mascot width (sprites are 120–230); the mascot blits flush-right
+// in the SPRITE_W surface, so its visual centre is offset from the surface centre.
+const MASCOT_W: i32 = 188;
+const STATE_DEBOUNCE: u32 = 5; // ticks a base state must hold before committing (anti-flap)
+const FORCE_TICKS: u32 = 80;   // hold a summoned / forced state ~8s before the state machine resumes
+// click model: a quick tap toggles the menu; a long press (or a clear drag)
+// moves the pet. Distinguishes "tap to act" from "hold to drag".
+const LONG_PRESS: Duration = Duration::from_millis(350);
+const DRAG_SLOP: f64 = 36.0; // px of motion that promotes a press to a drag immediately
+const MENU_GAP: usize = 6; // px between the action menu's right edge and the mascot
 const CROSS_MSG: &str = "a doorway! crossing to the next screen";
 const WALL_MSG: &str = "a wall here - cant cross this one";
 
@@ -72,6 +86,14 @@ struct OutputGeom {
     y: i32,
     w: i32,
     h: i32,
+}
+
+/// An in-progress left-button press, tracked to tell a tap from a drag.
+struct Press {
+    start: (f64, f64), // where the press began (surface-local)
+    last: (f64, f64),  // last motion position, for incremental drag delta
+    time: Instant,     // when it began, for the long-press threshold
+    dragging: bool,    // promoted to a move once held long / moved far enough
 }
 
 struct LinuxPal {
@@ -90,7 +112,12 @@ struct LinuxPal {
     sprites: Sprites,
     animator: Animator,
     bubble: bubble::Bubble,
-    llm_rx: Option<std::sync::mpsc::Receiver<llm::LlmResponse>>,
+    // persistent async bubble channel — drained every tick. Ambient tips,
+    // streamed answers, and morning-routine status all post here (event-bus seed).
+    bubble_tx: std::sync::mpsc::Sender<llm::BubbleUpdate>,
+    bubble_rx: std::sync::mpsc::Receiver<llm::BubbleUpdate>,
+    // commands from the control socket (summon / ask / morning / say / state / quit)
+    control_rx: std::sync::mpsc::Receiver<control::ControlEvent>,
     win_ctx: Arc<Mutex<WindowContext>>,
     player_state: Arc<Mutex<player::PlayerState>>,
 
@@ -98,8 +125,15 @@ struct LinuxPal {
     width: u32,
     height: u32,
 
-    // drag state: surface-local grab point while left button held
-    drag_grab: Option<(f64, f64)>,
+    // pointer: current press (tap vs drag) + last cursor pos for menu hover
+    press: Option<Press>,
+    pointer_pos: (f64, f64),
+    menu_open: bool,
+    // keyboard: in-surface "ask" typing. Modal Exclusive focus only while typing,
+    // so normal taps/drags never steal keys from the rest of the desktop.
+    keyboard: Option<wl_keyboard::WlKeyboard>,
+    input_mode: bool,
+    input_buf: String,
     margin_left: i32,
     margin_top: i32,
 
@@ -116,6 +150,15 @@ struct LinuxPal {
     // startup greeting
     greet_ticks_left: u32,
     greeted: bool,
+
+    // forced state from a control command (summon / state) — held briefly
+    // so the window-driven state machine doesn't immediately override it
+    force_state: Option<State>,
+    force_ticks_left: u32,
+
+    // anti-flap debounce for base-state transitions
+    pending_state: Option<State>,
+    pending_count: u32,
 
     // multi-output free roam: layout + global sprite position/target + PRNG
     outputs: Vec<OutputGeom>,
@@ -154,10 +197,19 @@ impl LinuxPal {
         // blit mascot flush-right so variable-width sprites stay anchored to screen corner
         let x_offset = (w.saturating_sub(frame.width)) as usize;
 
-        if self.bubble.visible {
+        if self.menu_open {
+            let ox = menu_origin_x();
+            let hover = menu::hit_row(ox, self.pointer_pos.0, self.pointer_pos.1);
+            menu::draw(canvas, stride, ox, hover);
+        } else if self.input_mode {
+            // small bubble showing the question as it's typed (cursor = "_")
+            let text = format!("ask> {}_", self.input_buf);
+            bubble::draw_bubble(canvas, stride, true, &text, "", x_offset);
+        } else if self.bubble.visible {
             bubble::draw_bubble(
                 canvas,
                 stride,
+                self.bubble.plain,
                 &self.bubble.tip.clone(),
                 &self.bubble.joke.clone(),
                 x_offset,
@@ -175,13 +227,38 @@ impl LinuxPal {
     }
 
     fn sync_state(&mut self, qh: &QueueHandle<Self>) {
-        // poll for LLM response — update bubble if arrived
-        if let Some(rx) = &self.llm_rx {
-            if let Ok(resp) = rx.try_recv() {
-                self.bubble.update(&resp.tip, &resp.joke);
-                self.llm_rx = None;
-                log::info!("llm response received and applied to bubble");
+        // drain async bubble updates: ambient tips, streamed answers, status lines
+        while let Ok(update) = self.bubble_rx.try_recv() {
+            match update {
+                llm::BubbleUpdate::TipJoke { tip, joke } => self.bubble.update(&tip, &joke),
+                llm::BubbleUpdate::Plain(text) => self.bubble.show_answer(&text),
             }
+        }
+
+        // drain control-socket commands (summon / ask / morning / say / state / quit)
+        while let Ok(ev) = self.control_rx.try_recv() {
+            self.handle_control(ev);
+        }
+
+        // a still hold (no motion to trigger it) becomes a drag after the threshold
+        if let Some(p) = self.press.as_mut() {
+            if !p.dragging && p.time.elapsed() >= LONG_PRESS {
+                p.dragging = true;
+            }
+        }
+
+        // clicking the pet (menu open) or typing a question → show the
+        // "thinking" pose and freeze the window-driven state machine (no roam,
+        // no LLM churn) until it's dismissed
+        if self.menu_open || self.input_mode {
+            if self.menu_open {
+                self.bubble.visible = false; // panel replaces the bubble
+            }
+            if self.animator.state != State::Thinking {
+                self.animator.state = State::Thinking;
+                self.animator.reset();
+            }
+            return;
         }
 
         // startup greeting — cheer with happy state for a few seconds
@@ -197,10 +274,23 @@ impl LinuxPal {
             return;
         }
 
+        // a control command forced a state — hold it briefly, suppressing the
+        // window-driven state machine, then let normal behavior resume
+        if self.force_ticks_left > 0 {
+            if let Some(s) = self.force_state.clone() {
+                if self.animator.state != s {
+                    self.animator.state = s;
+                    self.animator.reset();
+                }
+            }
+            self.force_ticks_left -= 1;
+            return;
+        }
+
         // snapshot what MPRIS is playing
-        let (pmusic, pvideo, ptitle) = match self.player_state.lock() {
-            Ok(p) => (p.music, p.video, p.title.clone()),
-            Err(_) => (false, false, String::new()),
+        let (pmusic, pvideo, ptitle, pplayer) = match self.player_state.lock() {
+            Ok(p) => (p.music, p.video, p.title.clone(), p.player.clone()),
+            Err(_) => (false, false, String::new(), String::new()),
         };
 
         // read window context → base state + prompt string + media scope.
@@ -213,7 +303,7 @@ impl LinuxPal {
                 } else {
                     format!("{} - {}", ctx.class, ctx.title)
                 };
-                (s, cs, context::media_applies(&ctx, &ptitle))
+                (s, cs, context::media_applies(&ctx, &ptitle, &pplayer))
             }
             Err(_) => return,
         };
@@ -276,18 +366,156 @@ impl LinuxPal {
         };
 
         if effective != self.animator.state {
-            log::info!("state → {:?}", effective);
+            // roam / media apply instantly; base+mood states must hold STATE_DEBOUNCE
+            // ticks first, so window-recency flapping doesn't churn state + LLM calls
+            let immediate = matches!(
+                effective,
+                State::Walk(_) | State::Jamming | State::Cozy
+            );
+            let ready = if immediate {
+                true
+            } else if self.pending_state.as_ref() == Some(&effective) {
+                self.pending_count += 1;
+                self.pending_count >= STATE_DEBOUNCE
+            } else {
+                self.pending_state = Some(effective.clone());
+                self.pending_count = 1;
+                false
+            };
 
-            // walk is ambient — no bubble/LLM churn for it
-            if !matches!(effective, State::Walk(_)) {
-                self.bubble.show_loading();
-                let (tx, rx) = std::sync::mpsc::channel();
-                self.llm_rx = Some(rx);
-                llm::query_async(context_str, tx);
+            if ready {
+                log::info!("state → {:?}", effective);
+                if !matches!(effective, State::Walk(_)) {
+                    self.bubble.show_loading();
+                    llm::query_async(context_str, self.bubble_tx.clone());
+                }
+                self.animator.state = effective;
+                self.animator.reset();
+                self.pending_state = None;
+                self.pending_count = 0;
             }
+        } else {
+            self.pending_state = None;
+            self.pending_count = 0;
+        }
+    }
 
-            self.animator.state = effective;
-            self.animator.reset();
+    /// Act on a command from the control socket.
+    fn handle_control(&mut self, ev: control::ControlEvent) {
+        use control::ControlEvent::*;
+        match ev {
+            Summon => {
+                self.bubble.say("hi! ask me:  linuxpal-ctl ask \"...\"");
+                self.force_state = Some(State::Happy);
+                self.force_ticks_left = FORCE_TICKS;
+                self.greet_ticks_left = 0; // don't let a pending greet stomp this
+            }
+            Say(msg) => self.bubble.say(&msg),
+            Ask(question) => {
+                log::info!("control: ask {question:?}");
+                self.bubble.show_loading();
+                llm::query_ask(question, self.bubble_tx.clone());
+            }
+            Morning => {
+                log::info!("control: morning routine");
+                morning::run(self.bubble_tx.clone());
+            }
+            SetState(name) => match parse_state(&name) {
+                Some(s) => {
+                    self.force_state = Some(s);
+                    self.force_ticks_left = FORCE_TICKS;
+                }
+                None => self.bubble.say(&format!("unknown state: {name}")),
+            },
+            Quit => {
+                log::info!("control: quit");
+                std::process::exit(0);
+            }
+        }
+    }
+
+    /// Move the surface by a cursor delta (anchored TOP|LEFT → grow margins).
+    fn drag_by(&mut self, dx: f64, dy: f64) {
+        self.margin_left = (self.margin_left + dx as i32).max(0);
+        self.margin_top = (self.margin_top + dy as i32).max(0);
+        if let Some(g) = self.outputs.get(self.cur_idx) {
+            self.pos_x = g.x + self.margin_left;
+            self.pos_y = g.y + self.margin_top;
+        }
+        if let Some(surface) = &self.layer_surface {
+            surface.set_margin(self.margin_top, 0, 0, self.margin_left);
+            surface.commit();
+        }
+    }
+
+    /// A quick tap: open the menu, or pick a row if it's already open.
+    fn handle_tap(&mut self, pos: (f64, f64)) {
+        if self.input_mode {
+            self.cancel_input(); // tapping the pet while typing backs out
+            return;
+        }
+        if self.menu_open {
+            let ox = menu_origin_x();
+            if let Some(action) = menu::hit_row(ox, pos.0, pos.1).and_then(menu::action) {
+                self.do_menu_action(action);
+            }
+            self.menu_open = false; // any tap dismisses the menu
+        } else {
+            self.menu_open = true;
+            self.bubble.visible = false; // menu replaces the bubble while open
+        }
+    }
+
+    /// Run the action behind a menu row — reuses the same plumbing as the socket.
+    fn do_menu_action(&mut self, action: menu::MenuAction) {
+        use menu::MenuAction::*;
+        log::info!("menu action: {action:?}");
+        match action {
+            Morning => morning::run(self.bubble_tx.clone()),
+            Terminal => spawn_exec("kitty"),
+            Browser => spawn_exec("zen-browser"),
+            Ask => self.begin_input(),
+            Quit => std::process::exit(0),
+        }
+    }
+
+    /// Grab (or release) modal keyboard focus for in-surface typing.
+    fn set_keyboard(&self, on: bool) {
+        if let Some(s) = &self.layer_surface {
+            s.set_keyboard_interactivity(if on {
+                KeyboardInteractivity::Exclusive
+            } else {
+                KeyboardInteractivity::None
+            });
+            s.commit();
+        }
+    }
+
+    /// Enter "ask" input mode: clear the buffer and grab the keyboard.
+    fn begin_input(&mut self) {
+        self.input_mode = true;
+        self.input_buf.clear();
+        self.menu_open = false;
+        self.set_keyboard(true);
+    }
+
+    /// Abandon input without asking.
+    fn cancel_input(&mut self) {
+        self.input_mode = false;
+        self.input_buf.clear();
+        self.set_keyboard(false);
+    }
+
+    /// Submit the typed question: release the keyboard and stream the answer.
+    fn submit_input(&mut self) {
+        let question = self.input_buf.trim().to_string();
+        self.input_mode = false;
+        self.input_buf.clear();
+        self.set_keyboard(false);
+        if !question.is_empty() {
+            log::info!("ask (in-surface): {question:?}");
+            self.bubble.show_loading();
+            llm::query_ask(question, self.bubble_tx.clone());
         }
     }
 
@@ -476,7 +704,8 @@ impl LinuxPal {
 
         let nx = step_axis(self.pos_x, self.target_x);
         let ny = step_axis(self.pos_y, self.target_y);
-        let cx = nx + SPRITE_W as i32 / 2;
+        // mascot is flush-right in the surface → its centre, not the surface centre
+        let cx = nx + SPRITE_W as i32 - MASCOT_W / 2;
         let cy = ny + SPRITE_H as i32 / 2;
 
         match self.output_at(cx, cy) {
@@ -660,6 +889,12 @@ impl SeatHandler for LinuxPal {
                 Err(e) => log::warn!("failed to get pointer: {e}"),
             }
         }
+        if capability == Capability::Keyboard && self.keyboard.is_none() {
+            match self.seat_state.get_keyboard(qh, &seat, None) {
+                Ok(k) => self.keyboard = Some(k),
+                Err(e) => log::warn!("failed to get keyboard: {e}"),
+            }
+        }
     }
 
     fn remove_capability(
@@ -672,6 +907,11 @@ impl SeatHandler for LinuxPal {
         if capability == Capability::Pointer {
             if let Some(p) = self.pointer.take() {
                 p.release();
+            }
+        }
+        if capability == Capability::Keyboard {
+            if let Some(k) = self.keyboard.take() {
+                k.release();
             }
         }
     }
@@ -692,34 +932,131 @@ impl PointerHandler for LinuxPal {
         for event in events {
             match event.kind {
                 PointerEventKind::Press { button, .. } if button == BTN_LEFT => {
-                    self.drag_grab = Some(event.position);
+                    self.press = Some(Press {
+                        start: event.position,
+                        last: event.position,
+                        time: Instant::now(),
+                        dragging: false,
+                    });
                 }
                 PointerEventKind::Release { button, .. } if button == BTN_LEFT => {
-                    self.drag_grab = None;
+                    // released without ever dragging → it was a tap
+                    if let Some(p) = self.press.take() {
+                        if !p.dragging {
+                            self.handle_tap(p.start);
+                        }
+                    }
                 }
                 PointerEventKind::Leave { .. } => {
-                    self.drag_grab = None;
+                    self.press = None;
                 }
                 PointerEventKind::Motion { .. } => {
-                    if let Some((gx, gy)) = self.drag_grab {
-                        // anchored TOP|LEFT: growing left/top margin follows cursor delta
-                        let dx = event.position.0 - gx;
-                        let dy = event.position.1 - gy;
-                        self.margin_left = (self.margin_left + dx as i32).max(0);
-                        self.margin_top = (self.margin_top + dy as i32).max(0);
-                        if let Some(g) = self.outputs.get(self.cur_idx) {
-                            self.pos_x = g.x + self.margin_left;
-                            self.pos_y = g.y + self.margin_top;
+                    self.pointer_pos = event.position;
+                    // decide drag promotion + delta without holding the press
+                    // borrow across the self.drag_by() call
+                    let mut delta = None;
+                    if let Some(p) = self.press.as_mut() {
+                        let tx = event.position.0 - p.start.0;
+                        let ty = event.position.1 - p.start.1;
+                        if !p.dragging && (tx * tx + ty * ty).sqrt() > DRAG_SLOP {
+                            p.dragging = true;
                         }
-                        if let Some(surface) = &self.layer_surface {
-                            surface.set_margin(self.margin_top, 0, 0, self.margin_left);
-                            surface.commit();
+                        if p.dragging {
+                            delta = Some((event.position.0 - p.last.0, event.position.1 - p.last.1));
                         }
+                        p.last = event.position;
+                    }
+                    if let Some((dx, dy)) = delta {
+                        self.drag_by(dx, dy);
                     }
                 }
                 _ => {}
             }
         }
+    }
+}
+
+// keysym raw values for the keys we special-case during input
+const KEY_BACKSPACE: u32 = 0xff08;
+const KEY_RETURN: u32 = 0xff0d;
+const KEY_KP_ENTER: u32 = 0xff8d;
+const KEY_ESCAPE: u32 = 0xff1b;
+
+impl KeyboardHandler for LinuxPal {
+    fn enter(
+        &mut self,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+        _: &wl_keyboard::WlKeyboard,
+        _: &wl_surface::WlSurface,
+        _: u32,
+        _: &[u32],
+        _: &[smithay_client_toolkit::seat::keyboard::Keysym],
+    ) {
+    }
+
+    fn leave(
+        &mut self,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+        _: &wl_keyboard::WlKeyboard,
+        _: &wl_surface::WlSurface,
+        _: u32,
+    ) {
+        // lost keyboard focus mid-type → abandon the input
+        if self.input_mode {
+            self.cancel_input();
+        }
+    }
+
+    fn press_key(
+        &mut self,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+        _: &wl_keyboard::WlKeyboard,
+        _: u32,
+        event: KeyEvent,
+    ) {
+        if !self.input_mode {
+            return;
+        }
+        match event.keysym.raw() {
+            KEY_ESCAPE => self.cancel_input(),
+            KEY_RETURN | KEY_KP_ENTER => self.submit_input(),
+            KEY_BACKSPACE => {
+                self.input_buf.pop();
+            }
+            _ => {
+                if let Some(text) = &event.utf8 {
+                    for ch in text.chars() {
+                        if !ch.is_control() {
+                            self.input_buf.push(ch);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    fn release_key(
+        &mut self,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+        _: &wl_keyboard::WlKeyboard,
+        _: u32,
+        _: KeyEvent,
+    ) {
+    }
+
+    fn update_modifiers(
+        &mut self,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+        _: &wl_keyboard::WlKeyboard,
+        _: u32,
+        _: smithay_client_toolkit::seat::keyboard::Modifiers,
+        _: u32,
+    ) {
     }
 }
 
@@ -736,7 +1073,46 @@ delegate_layer!(LinuxPal);
 delegate_shm!(LinuxPal);
 delegate_seat!(LinuxPal);
 delegate_pointer!(LinuxPal);
+delegate_keyboard!(LinuxPal);
 delegate_registry!(LinuxPal);
+
+/// Action-menu panel left-x: anchored just left of the mascot (which blits
+/// flush-right, nominal left `SPRITE_W - MASCOT_W`). Stable across animation
+/// frames so draw and hit-test agree.
+fn menu_origin_x() -> usize {
+    (SPRITE_W as usize)
+        .saturating_sub(MASCOT_W as usize)
+        .saturating_sub(menu::PANEL_W + MENU_GAP)
+        .max(4)
+}
+
+/// Launch an app through Hyprland, off-thread so it never stalls rendering.
+fn spawn_exec(cmd: &str) {
+    let cmd = cmd.to_string();
+    std::thread::spawn(move || {
+        let _ = std::process::Command::new("hyprctl")
+            .args(["dispatch", "exec", &cmd])
+            .status();
+    });
+}
+
+/// Map a control-socket state name to an animation state. `Walk` is excluded —
+/// it needs a direction and is driven by roaming, not by command.
+fn parse_state(name: &str) -> Option<State> {
+    Some(match name {
+        "idle" => State::Idle,
+        "alert" => State::Alert,
+        "thinking" => State::Thinking,
+        "happy" => State::Happy,
+        "working" => State::Working,
+        "jamming" | "jam" => State::Jamming,
+        "cozy" => State::Cozy,
+        "curious" => State::Curious,
+        "working_empty" | "workingempty" => State::WorkingEmpty,
+        "training_done" | "trainingdone" => State::TrainingDone,
+        _ => return None,
+    })
+}
 
 fn main() {
     env_logger::init();
@@ -754,6 +1130,14 @@ fn main() {
     // background MPRIS poller — exposes playing music/video + track title/url
     let player_state = Arc::new(Mutex::new(player::PlayerState::default()));
     player::spawn_player_monitor(Arc::clone(&player_state));
+
+    // persistent bubble channel — async producers (LLM tips, streamed answers,
+    // morning-routine status) post updates the main loop drains each tick
+    let (bubble_tx, bubble_rx) = std::sync::mpsc::channel();
+
+    // control socket — external triggers (summon / ask / morning / say / state)
+    let (control_tx, control_rx) = std::sync::mpsc::channel();
+    control::spawn_control_listener(control_tx);
 
     let conn = Connection::connect_to_env().expect("failed to connect to Wayland");
     let (globals, mut queue) =
@@ -788,13 +1172,20 @@ fn main() {
         sprites,
         animator,
         bubble: bubble::Bubble::new(),
-        llm_rx: None,
+        bubble_tx,
+        bubble_rx,
+        control_rx,
         win_ctx,
         player_state,
         configured: false,
         width: SPRITE_W,
         height: SPRITE_H,
-        drag_grab: None,
+        press: None,
+        pointer_pos: (0.0, 0.0),
+        menu_open: false,
+        keyboard: None,
+        input_mode: false,
+        input_buf: String::new(),
         margin_left: MARGIN,
         margin_top: MARGIN,
         idle_ticks: 0,
@@ -807,6 +1198,10 @@ fn main() {
         walk_dir: Direction::Right,
         greet_ticks_left: GREET_TICKS,
         greeted: false,
+        force_state: None,
+        force_ticks_left: 0,
+        pending_state: None,
+        pending_count: 0,
         outputs: Vec::new(),
         cur_idx: 0,
         pos_init: false,

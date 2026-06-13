@@ -1,7 +1,21 @@
+use std::io::BufRead;
 use std::sync::mpsc;
 
 const OLLAMA_URL: &str = "http://localhost:11434/api/generate";
 const MODEL: &str = "qwen2.5:1.5b";
+
+/// A message destined for the bubble, produced asynchronously by the LLM.
+///
+/// One persistent channel carries both flavours so the main loop has a single
+/// place to drain (the seed of the roadmap's "event bus").
+#[derive(Debug, Clone)]
+pub enum BubbleUpdate {
+    /// Ambient two-line state tip + joke.
+    TipJoke { tip: String, joke: String },
+    /// Free-form text (a streamed answer, or a status line). Replaces the bubble
+    /// body as it grows, so answers fill in live.
+    Plain(String),
+}
 
 #[derive(Debug, Clone)]
 pub struct LlmResponse {
@@ -52,12 +66,89 @@ fn parse_response(raw: &str) -> LlmResponse {
     LlmResponse { tip, joke }
 }
 
-/// Non-blocking — spawns a thread, sends result back via mpsc
-pub fn query_async(context: String, tx: mpsc::Sender<LlmResponse>) {
+/// Ambient state tip — non-blocking, sends a `TipJoke` back via mpsc.
+pub fn query_async(context: String, tx: mpsc::Sender<BubbleUpdate>) {
     std::thread::spawn(move || {
-        let result = query_blocking(&context);
-        let _ = tx.send(result);
+        let r = query_blocking(&context);
+        let _ = tx.send(BubbleUpdate::TipJoke { tip: r.tip, joke: r.joke });
     });
+}
+
+/// Free-form question — non-blocking, streams `Plain` chunks into the bubble.
+pub fn query_ask(question: String, tx: mpsc::Sender<BubbleUpdate>) {
+    std::thread::spawn(move || {
+        if let Err(e) = stream_ask(&question, &tx) {
+            log::warn!("ask query failed: {e}");
+            let _ = tx.send(BubbleUpdate::Plain(
+                "ask failed — is ollama running?".into(),
+            ));
+        }
+    });
+}
+
+/// Stream an answer from Ollama token-by-token, pushing the growing text into
+/// the bubble (throttled to ~10 updates/sec).
+fn stream_ask(question: &str, tx: &mpsc::Sender<BubbleUpdate>) -> Result<(), String> {
+    let prompt = format!(
+        "You are LinuxPal, a concise Linux desktop assistant. \
+         Answer in plain text (no markdown), at most 40 words.\nQuestion: {question}"
+    );
+
+    let body = serde_json::json!({
+        "model": MODEL,
+        "prompt": prompt,
+        "stream": true,
+        "options": {
+            "temperature": 0.6,
+            "num_predict": 200
+        }
+    });
+
+    let client = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(60))
+        .build()
+        .map_err(|e| e.to_string())?;
+
+    let resp = client
+        .post(OLLAMA_URL)
+        .json(&body)
+        .send()
+        .map_err(|e| e.to_string())?;
+
+    let reader = std::io::BufReader::new(resp);
+    let mut acc = String::new();
+    let mut last_push = std::time::Instant::now();
+
+    // Ollama streams newline-delimited JSON objects, each with a `response`
+    // fragment and a `done` flag on the last.
+    for line in reader.lines() {
+        let line = line.map_err(|e| e.to_string())?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        let v: serde_json::Value = match serde_json::from_str(&line) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        if let Some(chunk) = v["response"].as_str() {
+            acc.push_str(chunk);
+        }
+        if last_push.elapsed() >= std::time::Duration::from_millis(100) && !acc.trim().is_empty() {
+            let _ = tx.send(BubbleUpdate::Plain(acc.trim().to_string()));
+            last_push = std::time::Instant::now();
+        }
+        if v["done"].as_bool().unwrap_or(false) {
+            break;
+        }
+    }
+
+    let final_text = if acc.trim().is_empty() {
+        "no answer".to_string()
+    } else {
+        acc.trim().to_string()
+    };
+    let _ = tx.send(BubbleUpdate::Plain(final_text));
+    Ok(())
 }
 
 fn query_blocking(context: &str) -> LlmResponse {

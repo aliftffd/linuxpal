@@ -1,9 +1,13 @@
-const BUBBLE_TICKS: u64 = 80; // 8 seconds at 10Hz
+const BUBBLE_TICKS: u64 = 80;  // 8 seconds at 10Hz
+const ANSWER_TICKS: u64 = 250; // 25s — answers are longer to read
 
 pub struct Bubble {
     pub tip:     String,
     pub joke:    String,
     pub visible: bool,
+    /// `true` → render `tip` as a single wrapped block (a message or streamed
+    /// answer); `false` → the two-section TIP / JOKE layout.
+    pub plain:   bool,
     ticks_left:  u64,
 }
 
@@ -13,6 +17,7 @@ impl Bubble {
             tip:        String::new(),
             joke:       String::new(),
             visible:    false,
+            plain:      false,
             ticks_left: 0,
         }
     }
@@ -20,23 +25,35 @@ impl Bubble {
     /// Show immediately with loading placeholders
     pub fn show_loading(&mut self) {
         self.tip        = "thinking...".into();
-        self.joke       = "thinking...".into();
+        self.joke       = String::new();
         self.visible    = true;
+        self.plain      = true;
         self.ticks_left = BUBBLE_TICKS;
     }
 
-    /// Show a one-off remark (used for screen-edge comments).
+    /// Show a one-off remark (used for screen-edge comments, status lines).
     pub fn say(&mut self, msg: &str) {
         self.tip = msg.to_string();
         self.joke = String::new();
         self.visible = true;
+        self.plain = true;
         self.ticks_left = BUBBLE_TICKS;
     }
 
-    /// Update content when LLM responds
+    /// Show a free-form answer (held longer so there's time to read it).
+    pub fn show_answer(&mut self, text: &str) {
+        self.tip = text.to_string();
+        self.joke = String::new();
+        self.visible = true;
+        self.plain = true;
+        self.ticks_left = ANSWER_TICKS;
+    }
+
+    /// Update content when the ambient state LLM responds (TIP / JOKE layout).
     pub fn update(&mut self, tip: &str, joke: &str) {
         self.tip        = tip.to_string();
         self.joke       = joke.to_string();
+        self.plain      = false;
         // reset timer so user has full time to read
         self.ticks_left = BUBBLE_TICKS;
     }
@@ -55,12 +72,15 @@ impl Bubble {
 const TAIL_LEN: usize = 8;
 const TAIL_GAP: usize = 6;
 
-/// Draw two-section bubble: TIP on top, JOKE on bottom.
-/// Box hugs mascot's left edge so tail points right toward it.
-/// `mascot_left` = canvas x where mascot sprite begins.
+/// Draw the speech bubble. Box hugs the mascot's left edge so the tail points
+/// right toward it. `mascot_left` = canvas x where the mascot sprite begins.
+///
+/// `plain` → render `tip` as one wrapped block (messages, streamed answers);
+/// otherwise the two-section TIP-on-top / JOKE-on-bottom state layout.
 pub fn draw_bubble(
     buf:    &mut [u8],
     stride: usize,
+    plain:  bool,
     tip:    &str,
     joke:   &str,
     mascot_left: usize,
@@ -84,6 +104,15 @@ pub fn draw_bubble(
         let ty = by + bh / 2 - (7 - i);
         let th = (i * 2 + 2).min(bh);
         fill_rect(buf, stride, tx, ty, 1, th, 0x14, 0x1e, 0x2a, 220);
+    }
+
+    if plain {
+        // single wrapped block — fills the box, up to what fits (7 lines @ 13px)
+        let lines = wrap_text(tip, 40);
+        for (i, line) in lines.iter().take(7).enumerate() {
+            draw_text(buf, stride, line, bx + 10, by + 10 + i * 13, 0xe0, 0xd8, 0x98);
+        }
+        return;
     }
 
     // TIP label — amber #e8943c
@@ -124,7 +153,7 @@ fn wrap_text(text: &str, max_chars: usize) -> Vec<String> {
     lines
 }
 
-fn fill_rect(
+pub(crate) fn fill_rect(
     buf: &mut [u8], stride: usize,
     x: usize, y: usize, w: usize, h: usize,
     r: u8, g: u8, b: u8, a: u8,
@@ -152,7 +181,7 @@ fn draw_border(
     fill_rect(buf, stride, x + w - 2, y,   2, h, r, g, b, 255);
 }
 
-fn draw_text(
+pub(crate) fn draw_text(
     buf: &mut [u8], stride: usize,
     text: &str, x: usize, y: usize,
     r: u8, g: u8, b: u8,

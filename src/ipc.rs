@@ -90,8 +90,10 @@ fn poll_context() -> Option<WindowContext> {
 
     Some(match win {
         Some(c) => WindowContext {
-            class: c["class"].as_str().unwrap_or("").to_lowercase(),
-            title: c["title"].as_str().unwrap_or("").to_lowercase(),
+            // trim: hyprctl titles often carry trailing whitespace (e.g. "tmux "),
+            // which would break exact matches like `title == "tmux"`
+            class: c["class"].as_str().unwrap_or("").trim().to_lowercase(),
+            title: c["title"].as_str().unwrap_or("").trim().to_lowercase(),
         },
         None => WindowContext::empty(), // empty workspace → idle
     })

@@ -1,0 +1,16 @@
+#!/usr/bin/env bash
+# Toggle the LinuxPal mascot: quit if it's running, launch it if not.
+# Bound to a Hyprland key so you can start it again after the menu's "quit"
+# without touching a terminal. Installed to ~/.local/bin by install.sh.
+set -u
+
+ASSET_DIR="$HOME/.local/share/linuxpal/sprites"
+BIN="$HOME/.local/bin/linuxpal"
+
+if pgrep -x linuxpal >/dev/null 2>&1; then
+    # prefer a clean shutdown over the control socket; fall back to a signal
+    linuxpal-ctl quit 2>/dev/null || pkill -x linuxpal
+else
+    # detach so it outlives this script (and the Hyprland exec that ran it)
+    setsid env LINUXPAL_ASSETS="$ASSET_DIR" "$BIN" >/dev/null 2>&1 </dev/null &
+fi

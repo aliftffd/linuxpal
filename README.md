@@ -24,6 +24,11 @@ roams freely across your monitors, and pops up a speech bubble with a tip + joke
   plain YouTube video → cozy. Scoped to the deciding window so a video on another screen
   doesn't hijack the mood.
 - **Local LLM tips** — speech bubble with a TIP + JOKE from Ollama (optional).
+- **Ask it anything** — `linuxpal-ctl ask "…"` streams a short LLM answer into the bubble live.
+- **Control socket** — summon, ask, force a mood, or run a routine from a Hyprland keybind or any
+  script (`linuxpal-ctl`, or raw `socat`).
+- **Morning routine** — one trigger launches your daily apps in order (no LLM), configured in
+  `~/.config/linuxpal/morning.toml`.
 - **Startup greeting** — cheers you on at login.
 - **Survives monitor power-off** — re-pins to a remaining screen instead of dying.
 
@@ -126,14 +131,81 @@ wayland outputs (main.rs) ─┘                                   │
 - **`sprites.rs`** — sprite loading + the `Animator` frame timing per state.
 - **`main.rs`** — Wayland layer-shell surface, the per-tick state machine, global-coordinate
   roaming across all outputs, monitor hop (`pin_to`), drag-to-move, and rendering.
-- **`bubble.rs`** / **`renderer.rs`** — speech bubble (bitmap font) and ARGB blitting.
-- **`llm.rs`** — async Ollama query for the bubble text.
+- **`bubble.rs`** / **`renderer.rs`** — speech bubble (bitmap font, TIP/JOKE + plain modes) and
+  ARGB blitting.
+- **`llm.rs`** — async Ollama queries: ambient `TipJoke` tips and streamed `ask` answers, both
+  posted over one bubble channel the main loop drains each tick.
+- **`control.rs`** — Unix control socket → `ControlEvent`s (summon / ask / morning / say / state /
+  quit). The single entry point external triggers reuse.
+- **`morning.rs`** — reads `morning.toml` and launches your daily apps via `hyprctl dispatch exec`.
 
 ---
 
 ## Controls
 
-- **Drag** the mascot with the left mouse button to reposition it.
+- **Tap** the mascot (quick click) → opens a small **action menu** beside it: morning routine,
+  terminal, browser, ask, quit. Tap a row to run it; tap anywhere to dismiss.
+- **Hold** (~350ms) then drag, or just click-and-drag past a few px → **reposition** it.
+- **Ask** (menu → `ask`) → type your question right in the pet's bubble; **Enter** sends (answer
+  streams in), **Esc** or a tap cancels. Keyboard is grabbed only while typing.
+- **Start / stop** without a terminal → bind a key to the `linuxpal-toggle` script (quits if
+  running, launches if not). `install.sh` installs the script; add the bind to your Hyprland
+  keybinds, e.g. `bindd = $mainMod SHIFT, P, toggle LinuxPal, exec, $HOME/.local/bin/linuxpal-toggle`.
+  So after the menu's **quit**, the same key brings it back.
+
+### Talk to it (control socket)
+
+LinuxPal listens on a Unix socket at `$XDG_RUNTIME_DIR/linuxpal.sock`. The `linuxpal-ctl` helper
+(installed alongside the main binary) sends commands:
+
+```sh
+linuxpal-ctl summon                       # pop up and wave
+linuxpal-ctl ask "how do I list open ports?"   # streamed LLM answer in the bubble
+linuxpal-ctl say "build done"             # show a one-off message
+linuxpal-ctl morning                      # run the morning launch routine
+linuxpal-ctl state jamming                # force a mood for a few seconds
+linuxpal-ctl quit                         # stop it
+```
+
+No helper needed in a pinch — any socket client works:
+
+```sh
+echo 'ask what is a tmpfs?' | socat - "UNIX-CONNECT:$XDG_RUNTIME_DIR/linuxpal.sock"
+```
+
+Wire it to Hyprland keybinds (`~/.config/hypr/.../UserKeybinds.conf`):
+
+```ini
+bind = SUPER, P, exec, linuxpal-ctl summon
+bind = SUPER, M, exec, linuxpal-ctl morning
+bind = SUPER, A, exec, linuxpal-ctl ask "$(fuzzel --dmenu --prompt 'ask> ')"
+```
+
+The `ask` bind turns a launcher prompt (`fuzzel`/`wofi`/`rofi`) into a question box from anywhere —
+no in-surface keyboard handling required.
+
+### Morning routine
+
+`linuxpal-ctl morning` launches your daily apps in order via `hyprctl dispatch exec`. First run
+writes a commented default to `~/.config/linuxpal/morning.toml`:
+
+```toml
+[[apps]]
+cmd = "zen-browser"
+
+[[apps]]
+cmd = "kitty"
+args = "-e tmux new-session -As main"
+
+[[apps]]
+cmd = "spotify"
+
+# optional per-app pause before the next launch
+# [[apps]]
+# cmd = "xfreerdp"
+# args = "/v:HOST /u:USER +clipboard"
+# delay_ms = 2000
+```
 
 ---
 
