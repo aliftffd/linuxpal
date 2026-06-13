@@ -1,0 +1,16 @@
+# Rust build output
+/target
+
+# Backtraces
+*.rs.bk
+
+# Design/sprite source archives + extracted packs (regenerated, not source)
+*.zip
+linuxpal_design_pack/
+
+# Editor / OS cruft
+*.swp
+*~
+.DS_Store
+.idea/
+.vscode/
