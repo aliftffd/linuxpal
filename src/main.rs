@@ -7,7 +7,6 @@ mod renderer;
 mod sprites;
 
 use std::os::unix::io::AsFd;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -61,6 +60,8 @@ const FALLBACK_W: i32 = 1920;
 const FALLBACK_H: i32 = 1080;
 
 const WALL_PAD: i32 = 250; // let targets overshoot bounds so it bumps walls
+const GREET_TICKS: u32 = 80; // 8s welcome on launch
+const GREET_MSG: &str = "hello! lets get some ideas and tasks done!";
 const CROSS_MSG: &str = "a doorway! crossing to the next screen";
 const WALL_MSG: &str = "a wall here - cant cross this one";
 
@@ -91,8 +92,7 @@ struct LinuxPal {
     bubble: bubble::Bubble,
     llm_rx: Option<std::sync::mpsc::Receiver<llm::LlmResponse>>,
     win_ctx: Arc<Mutex<WindowContext>>,
-    music_playing: Arc<AtomicBool>,
-    video_playing: Arc<AtomicBool>,
+    player_state: Arc<Mutex<player::PlayerState>>,
 
     configured: bool,
     width: u32,
@@ -112,6 +112,10 @@ struct LinuxPal {
     walk_ticks_left: u32,
     park_ticks_left: u32,
     walk_dir: Direction,
+
+    // startup greeting
+    greet_ticks_left: u32,
+    greeted: bool,
 
     // multi-output free roam: layout + global sprite position/target + PRNG
     outputs: Vec<OutputGeom>,
@@ -180,17 +184,28 @@ impl LinuxPal {
             }
         }
 
-        let music = self.music_playing.load(Ordering::Relaxed);
-        let video = self.video_playing.load(Ordering::Relaxed);
-
-        // roam in progress — walk between spots, jam when parked
-        if self.roaming {
-            self.advance_walk(music, qh);
+        // startup greeting — cheer with happy state for a few seconds
+        if self.greet_ticks_left > 0 {
+            if !self.greeted {
+                self.bubble.say(GREET_MSG);
+                self.animator.state = State::Happy;
+                self.animator.reset();
+                self.greeted = true;
+                log::info!("greeting");
+            }
+            self.greet_ticks_left -= 1;
             return;
         }
 
-        // read window context → base state + prompt string + media scope
-        let (base, context_str, media_here) = match self.win_ctx.lock() {
+        // snapshot what MPRIS is playing
+        let (pmusic, pvideo, ptitle) = match self.player_state.lock() {
+            Ok(p) => (p.music, p.video, p.title.clone()),
+            Err(_) => (false, false, String::new()),
+        };
+
+        // read window context → base state + prompt string + media scope.
+        // media applies only if the playing track matches the deciding window.
+        let (base, context_str, media_ok) = match self.win_ctx.lock() {
             Ok(ctx) => {
                 let s = context::resolve_state(&ctx);
                 let cs = if ctx.title.is_empty() {
@@ -198,14 +213,20 @@ impl LinuxPal {
                 } else {
                     format!("{} - {}", ctx.class, ctx.title)
                 };
-                (s, cs, context::is_media_window(&ctx))
+                (s, cs, context::media_applies(&ctx, &ptitle))
             }
             Err(_) => return,
         };
 
-        // media (jamming/cozy) only counts when the deciding window IS the player
-        let music = music && media_here;
-        let video = video && media_here;
+        // gate BEFORE the roam check so a video on another screen can't make it dance
+        let music = pmusic && media_ok;
+        let video = pvideo && media_ok;
+
+        // roam in progress — walk between spots, jam when parked
+        if self.roaming {
+            self.advance_walk(music, qh);
+            return;
+        }
 
         // advance behavior timers off the base state
         match base {
@@ -569,8 +590,31 @@ impl OutputHandler for LinuxPal {
 }
 
 impl LayerShellHandler for LinuxPal {
-    fn closed(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &LayerSurface) {
-        std::process::exit(0);
+    fn closed(&mut self, _: &Connection, qh: &QueueHandle<Self>, layer: &LayerSurface) {
+        // a screen hop destroys the old surface → ignore its close event.
+        let is_current = self
+            .layer_surface
+            .as_ref()
+            .map(|s| s.wl_surface() == layer.wl_surface())
+            .unwrap_or(false);
+        if !is_current {
+            log::info!("old layer surface closed (re-pin), ignoring");
+            return;
+        }
+
+        // current surface gone — usually a monitor powered off / unplugged.
+        // survive by hopping to a remaining output instead of exiting.
+        self.rebuild_outputs();
+        if self.outputs.is_empty() {
+            log::warn!("no outputs left, exiting");
+            std::process::exit(0);
+        }
+        self.cur_idx = 0;
+        let (x, y) = (self.outputs[0].x, self.outputs[0].y);
+        self.pos_x = x + MARGIN;
+        self.pos_y = y + MARGIN;
+        log::warn!("current surface closed (monitor off?) → re-pinning to remaining output");
+        self.pin_to(0, qh);
     }
 
     fn configure(
@@ -707,10 +751,9 @@ fn main() {
     let win_ctx = Arc::new(Mutex::new(WindowContext::empty()));
     ipc::spawn_ipc_listener(Arc::clone(&win_ctx));
 
-    // background MPRIS poller — music vs plain-video playback flags
-    let music_playing = Arc::new(AtomicBool::new(false));
-    let video_playing = Arc::new(AtomicBool::new(false));
-    player::spawn_player_monitor(Arc::clone(&music_playing), Arc::clone(&video_playing));
+    // background MPRIS poller — exposes playing music/video + track title/url
+    let player_state = Arc::new(Mutex::new(player::PlayerState::default()));
+    player::spawn_player_monitor(Arc::clone(&player_state));
 
     let conn = Connection::connect_to_env().expect("failed to connect to Wayland");
     let (globals, mut queue) =
@@ -747,8 +790,7 @@ fn main() {
         bubble: bubble::Bubble::new(),
         llm_rx: None,
         win_ctx,
-        music_playing,
-        video_playing,
+        player_state,
         configured: false,
         width: SPRITE_W,
         height: SPRITE_H,
@@ -763,6 +805,8 @@ fn main() {
         walk_ticks_left: 0,
         park_ticks_left: 0,
         walk_dir: Direction::Right,
+        greet_ticks_left: GREET_TICKS,
+        greeted: false,
         outputs: Vec::new(),
         cur_idx: 0,
         pos_init: false,

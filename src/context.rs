@@ -1,27 +1,35 @@
 use crate::ipc::WindowContext;
 use crate::sprites::State;
 
-/// True if the deciding window is itself a media app (browser or player).
-/// Media (jamming/cozy) overrides only apply when this window is the source —
-/// stops a YouTube tab on another screen from hijacking the state.
-pub fn is_media_window(ctx: &WindowContext) -> bool {
+fn is_browser(class: &str) -> bool {
     matches!(
-        ctx.class.as_str(),
-        "zen" | "firefox"
-            | "chromium"
-            | "google-chrome"
-            | "brave-browser"
-            | "qutebrowser"
-            | "mpv"
-            | "vlc"
-            | "spotify"
-            | "spotify_player"
-            | "spotube"
-            | "ncspot"
-            | "cmus"
-            | "audacious"
-            | "rhythmbox"
+        class,
+        "zen" | "firefox" | "chromium" | "google-chrome" | "brave-browser" | "qutebrowser"
     )
+}
+
+fn is_player_app(class: &str) -> bool {
+    matches!(
+        class,
+        "mpv" | "vlc" | "spotify" | "spotify_player" | "spotube" | "ncspot" | "cmus"
+            | "audacious" | "rhythmbox"
+    )
+}
+
+/// Should the playing media (jamming/cozy) drive state for THIS deciding window?
+/// Dedicated players → yes (single window). Browsers are one MPRIS player across
+/// many tabs/screens, so require the playing track title to match the window's
+/// shown title — stops a video on another screen's tab from hijacking state.
+pub fn media_applies(ctx: &WindowContext, player_title: &str) -> bool {
+    let class = ctx.class.as_str();
+    if is_player_app(class) {
+        return true;
+    }
+    if is_browser(class) {
+        let pt = player_title.trim();
+        return pt.len() > 3 && ctx.title.contains(pt);
+    }
+    false
 }
 
 pub fn resolve_state(ctx: &WindowContext) -> State {

@@ -1,48 +1,64 @@
 use std::process::Command;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-/// Poll MPRIS (via `playerctl`) once a second. `music` = a music source is
-/// playing (mpv/spotify/music.youtube.com/…); `video` = a plain YouTube watch
-/// page is playing. Detected even when the player window isn't focused.
-pub fn spawn_player_monitor(music: Arc<AtomicBool>, video: Arc<AtomicBool>) {
+/// What MPRIS currently reports as playing. `title`/`url` belong to the playing
+/// source so the main loop can match it against the deciding window (a browser
+/// is one MPRIS player but may have tabs on several screens).
+#[derive(Debug, Clone, Default)]
+pub struct PlayerState {
+    pub music: bool,
+    pub video: bool,
+    pub title: String,
+    pub url: String,
+}
+
+/// Poll MPRIS (via `playerctl`) once a second.
+pub fn spawn_player_monitor(state: Arc<Mutex<PlayerState>>) {
     std::thread::spawn(move || loop {
-        let (m, v) = scan();
-        music.store(m, Ordering::Relaxed);
-        video.store(v, Ordering::Relaxed);
+        let s = scan();
+        if let Ok(mut g) = state.lock() {
+            *g = s;
+        }
         std::thread::sleep(Duration::from_secs(1));
     });
 }
 
-/// Returns (music_playing, video_playing).
-fn scan() -> (bool, bool) {
-    // one call → "status<TAB>url" per player
+fn scan() -> PlayerState {
     let out = match Command::new("playerctl")
-        .args(["--all-players", "metadata", "--format", "{{lc(status)}}\t{{xesam:url}}"])
+        .args([
+            "--all-players",
+            "metadata",
+            "--format",
+            "{{lc(status)}}\t{{xesam:url}}\t{{xesam:title}}",
+        ])
         .output()
     {
         Ok(o) => o,
         Err(e) => {
             log::debug!("playerctl unavailable: {e}");
-            return (false, false);
+            return PlayerState::default();
         }
     };
 
-    let mut music = false;
-    let mut video = false;
+    let mut st = PlayerState::default();
     for line in String::from_utf8_lossy(&out.stdout).lines() {
-        let (status, url) = line.split_once('\t').unwrap_or((line.trim(), ""));
-        if status.trim() != "playing" {
+        let mut parts = line.split('\t');
+        let status = parts.next().unwrap_or("").trim();
+        let url = parts.next().unwrap_or("").trim();
+        let title = parts.next().unwrap_or("").trim();
+        if status != "playing" {
             continue;
         }
-        if is_music(url.trim()) {
-            music = true;
+        if is_music(url) {
+            st.music = true;
         } else {
-            video = true; // plain YouTube watch page
+            st.video = true; // plain YouTube watch page
         }
+        st.url = url.to_lowercase();
+        st.title = title.to_lowercase();
     }
-    (music, video)
+    st
 }
 
 /// A playing source counts as music unless it's a plain YouTube watch page.
