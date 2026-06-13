@@ -202,8 +202,9 @@ cmd = "zen-browser"
 cmd = "kitty"
 args = "-e tmux new-session -As main"
 
-[[apps]]
-cmd = "spotify"
+# add what you want — e.g.:
+# [[apps]]
+# cmd = "spotify"
 
 # optional per-app pause before the next launch
 # [[apps]]

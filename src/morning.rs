@@ -41,8 +41,8 @@ cmd = "zen-browser"
 cmd = "kitty"
 args = "-e tmux new-session -As main"
 
-[[apps]]
-cmd = "spotify"
+# [[apps]]
+# cmd = "spotify"
 
 # [[apps]]
 # cmd = "xfreerdp"

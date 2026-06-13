@@ -153,7 +153,7 @@ Do NOT fine-tune immediately. Collect training data naturally first:
 Move from talking to doing.
 
 - **Morning routine** — one-click launch sequence for daily startup. No LLM needed.
-  Default sequence: Zen Browser → Kitty + tmux → Spotify → xfreerdp.
+  Default sequence: Zen Browser → Kitty + tmux (Spotify / xfreerdp commented, opt in).
   Configurable via `~/.config/linuxpal/morning.toml` with per-app delays.
   *Where:* new `morning.rs` — reads TOML config, spawns apps via
   `hyprctl dispatch exec` with configurable delays between launches.
