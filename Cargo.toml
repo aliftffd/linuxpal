@@ -12,6 +12,8 @@ path = "src/main.rs"
 wayland-client = "0.31"
 smithay-client-toolkit = { version = "0.19", features = ["calloop"] }
 wayland-protocols-wlr = { version = "0.3", features = ["client"] }
+# staging protocols — ext-idle-notify-v1 for real input-idle / "welcome back"
+wayland-protocols = { version = "0.32", features = ["client", "staging"] }
 
 # Pixel drawing
 tiny-skia = "0.11"

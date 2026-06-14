@@ -28,6 +28,8 @@ roams across your monitors, and speaks tips + jokes from a local LLM.
 - **Control socket** — summon, ask, force a mood, or run a routine from a Hyprland keybind or
   script.
 - **Morning routine** — one trigger launches your daily apps in order.
+- **Presence-aware** — real input-idle via `ext-idle-notify`: looks around when you step away,
+  cheers "welcome back" on return. Leans toward your cursor; lively idle blinking.
 - **Robust** — startup greeting; survives a monitor power-off by re-pinning to a live screen.
 
 ---
@@ -88,11 +90,14 @@ rebuild.
 | `model` | Ollama model for tips + ask | `"qwen2.5:1.5b"` |
 | `greet_msg` | startup greeting text | — |
 | `curious_after` | idle ticks before Curious | `150` |
-| `walk_every` | stable ticks before a roam starts | `100` |
+| `walk_every` | stable ticks before a roam starts | `50` |
 | `walk_duration` | non-music roam length | `120` |
 | `walk_step` | px moved per tick | `8` |
 | `park_duration` | dance-in-place ticks per spot during music | `30` |
 | `coffee_after` | working ticks before "out of coffee" | `1800` |
+| `lean_max` | px the pet leans toward your cursor (0 = off) | `6` |
+| `lean_radius` | cursor must be within this many px to react | `160` |
+| `idle_secs` | real input-idle (s) before "away" → curious + welcome-back | `60` |
 
 Timings are in **ticks** — 10 ticks = 1 second.
 

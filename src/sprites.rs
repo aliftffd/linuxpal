@@ -114,9 +114,14 @@ impl Animator {
 
     pub fn current_frame(&self) -> &'static str {
         match self.state {
-            //blink
+            // blink — pseudo-random cadence (varied gaps + occasional double
+            // blink) off the tick counter, so idle feels alive not metronomic
             State::Idle => {
-                if self.tick % 32 < 2 {
+                let cycle = self.tick / 2; // 200ms granularity
+                let h = (cycle ^ (cycle >> 3)).wrapping_mul(2654435761) >> 8;
+                let phase = cycle % 50; // ~5s base window
+                let blink = phase < 1 || (h % 7 == 0 && phase % 6 == 0);
+                if blink {
                     "idle_blink"
                 } else {
                     "idle_open"

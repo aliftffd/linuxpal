@@ -41,7 +41,11 @@ use smithay_client_toolkit::{
 use wayland_client::{
     globals::registry_queue_init,
     protocol::{wl_keyboard, wl_output, wl_pointer, wl_seat, wl_shm, wl_surface},
-    Connection, QueueHandle,
+    Connection, Dispatch, QueueHandle,
+};
+use wayland_protocols::ext::idle_notify::v1::client::{
+    ext_idle_notification_v1::{self, ExtIdleNotificationV1},
+    ext_idle_notifier_v1::{self, ExtIdleNotifierV1},
 };
 
 use ipc::WindowContext;
@@ -73,6 +77,9 @@ const DRAG_SLOP: f64 = 36.0; // px of motion that promotes a press to a drag imm
 const MENU_GAP: usize = 6; // px between the action menu's right edge and the mascot
 const CROSS_MSG: &str = "a doorway! crossing to the next screen";
 const WALL_MSG: &str = "a wall here - cant cross this one";
+const WELCOME_MSG: &str = "welcome back! ready when you are"; // on real input resume
+const WALL_COOLDOWN: u32 = 30;  // min ticks between WALL_MSG (~3s @ 10Hz) — anti-spam
+const WALL_SLIDE_MAX: u32 = 20; // slide along a wall this long before repicking a target
 
 /// One output's place in the global layout (logical coords).
 struct OutputGeom {
@@ -125,6 +132,7 @@ struct LinuxPal {
     // pointer: current press (tap vs drag) + last cursor pos for menu hover
     press: Option<Press>,
     pointer_pos: (f64, f64),
+    lean_px: i32, // eased horizontal lean toward the cursor (alive reaction)
     menu_open: bool,
     // keyboard: in-surface "ask" typing. Modal Exclusive focus only while typing,
     // so normal taps/drags never steal keys from the rest of the desktop.
@@ -139,10 +147,25 @@ struct LinuxPal {
     working_ticks: u64,
     stable_ticks: u64,
     last_base: Option<State>,
+    // live main-screen mood + context string, refreshed every tick; the roam
+    // pause poses as `roam_mood` and generates its tip/joke for `last_ctx`
+    roam_mood: State,
+    last_ctx: String,
     roaming: bool,
     walk_ticks_left: u32,
     park_ticks_left: u32,
     walk_dir: Direction,
+    // wall handling during roam: throttle the WALL_MSG and bound how long the
+    // sprite slides along an edge before giving up on the current target
+    wall_cooldown: u32,
+    wall_ticks: u32,
+
+    // real input-idle (ext-idle-notify-v1): notifier global + the armed
+    // notification, plus away/return flags driven by its idled/resumed events
+    idle_notifier: Option<ExtIdleNotifierV1>,
+    idle_notification: Option<ExtIdleNotificationV1>,
+    user_idle: bool,
+    idle_returned: bool,
 
     // startup greeting
     greet_ticks_left: u32,
@@ -214,6 +237,32 @@ impl LinuxPal {
         }
         self.bubble.tick();
 
+        // lean toward the cursor when it's over our surface and the pet is
+        // otherwise still — a subtle "I notice you" reaction. Eased 1px/frame
+        // so it glides. Applied only to the mascot blit (menu/bubble above use
+        // the static x_offset so their hit-tests stay valid).
+        // "still" = neutral pose only. Greeting/forced (welcome-back, summon,
+        // set-state) poses are exclusive too — don't let the lean leak in.
+        // (Thinking is gated by menu_open/input_mode already.)
+        let still = !self.menu_open
+            && !self.input_mode
+            && !self.roaming
+            && self.greet_ticks_left == 0
+            && self.force_ticks_left == 0;
+        let mascot_cx = x_offset as f64 + frame.width as f64 / 2.0;
+        let dx = self.pointer_pos.0 - mascot_cx;
+        let near = still
+            && self.cfg.lean_max > 0
+            && self.pointer_pos.1 >= 0.0
+            && self.pointer_pos.1 <= h as f64
+            && dx.abs() < self.cfg.lean_radius as f64;
+        let target = if near { (dx.signum() as i32) * self.cfg.lean_max } else { 0 };
+        self.lean_px += (target - self.lean_px).clamp(-1, 1);
+        // clamp into the surface so a rightward lean can't push the flush-right
+        // sprite past the right edge and clip it
+        let max_off = w.saturating_sub(frame.width) as i32;
+        let x_offset = (x_offset as i32 + self.lean_px).clamp(0, max_off.max(0)) as usize;
+
         renderer::blit_frame(canvas, w, h, stride, frame, x_offset);
 
         surface.wl_surface().attach(Some(buffer.wl_buffer()), 0, 0);
@@ -235,6 +284,18 @@ impl LinuxPal {
         // drain control-socket commands (summon / ask / morning / say / state / quit)
         while let Ok(ev) = self.control_rx.try_recv() {
             self.handle_control(ev);
+        }
+
+        // arm the real input-idle notification once the seat + notifier exist
+        // (seat arrives async). Drives accurate away/Curious + welcome-back.
+        if self.idle_notification.is_none() {
+            if let Some(n) = self.idle_notifier.clone() {
+                if let Some(seat) = self.seat_state.seats().next() {
+                    let ms = self.cfg.idle_secs.saturating_mul(1000);
+                    self.idle_notification = Some(n.get_idle_notification(ms, &seat, qh, ()));
+                    log::info!("idle notification armed ({}s)", self.cfg.idle_secs);
+                }
+            }
         }
 
         // a still hold (no motion to trigger it) becomes a drag after the threshold
@@ -270,6 +331,19 @@ impl LinuxPal {
             }
             self.greet_ticks_left -= 1;
             return;
+        }
+
+        // real input resumed after being away (ext-idle-notify) → welcome back,
+        // cheer briefly via the same forced-state path a control command uses
+        if self.idle_returned {
+            self.idle_returned = false;
+            // don't clobber an in-flight forced command (summon/state) that
+            // landed in the same window — let it finish its hold first
+            if self.force_ticks_left == 0 {
+                self.bubble.say(WELCOME_MSG);
+                self.force(State::Happy);
+                log::info!("welcome back");
+            }
         }
 
         // a control command forced a state — hold it briefly, suppressing the
@@ -310,13 +384,8 @@ impl LinuxPal {
         let music = pmusic && media_ok;
         let video = pvideo && media_ok;
 
-        // roam in progress — walk between spots, jam when parked
-        if self.roaming {
-            self.advance_walk(music, qh);
-            return;
-        }
-
-        // advance behavior timers off the base state
+        // advance behavior timers off the MAIN-SCREEN base state EVERY tick (even
+        // while roaming) so the mood always reflects what's open right now.
         match base {
             State::Idle => {
                 self.idle_ticks = self.idle_ticks.saturating_add(1);
@@ -331,9 +400,6 @@ impl LinuxPal {
                 self.working_ticks = 0;
             }
         }
-
-        // generic inactivity: roam whenever the window context hasn't changed
-        // for a while — works even with a window focused (terminal, editor…)
         if self.last_base.as_ref() == Some(&base) {
             self.stable_ticks = self.stable_ticks.saturating_add(1);
         } else {
@@ -341,26 +407,38 @@ impl LinuxPal {
             self.last_base = Some(base.clone());
         }
 
-        // priority: music-roam > jamming > video(cozy) > idle-roam > moods > base
+        // current mood from the main screen (HDMI-decided deciding window):
+        // Jamming/Cozy/WorkingEmpty/Curious/base. This is the pose the pet wears
+        // whenever it pauses, and the context the tip/joke is generated for.
+        // Roam is travel BETWEEN moods — it never replaces them.
+        let mood = self.mood_state(&base, music, video);
+        self.roam_mood = mood.clone();
+        self.last_ctx = context_str.clone();
+
+        // roam in progress — walk between spots; each pause poses as `mood`
+        if self.roaming {
+            self.advance_walk(music, qh);
+            return;
+        }
+
+        // companion mode: always be roaming, every situation, all screens. The
+        // mood (above) still drives every pause pose + tip/joke; roam just carries
+        // the pet around between them. Reached only when not already roaming.
+        if self.cfg.always_roam {
+            let s = self.begin_roam(music);
+            self.animator.state = s;
+            self.animator.reset();
+            return;
+        }
+
+        // non-companion: stroll only after a stable window, else hold the mood.
         let roam_trigger =
             self.stable_ticks >= self.cfg.walk_every && self.stable_ticks % self.cfg.walk_every == 0;
         let idle_or_work = matches!(base, State::Idle | State::Working);
-
-        let effective = if music && roam_trigger {
+        let effective = if roam_trigger && (music || idle_or_work) {
             self.begin_roam(music)
-        } else if music {
-            State::Jamming
-        } else if video {
-            // watching a plain video → settle in and get cozy
-            State::Cozy
-        } else if idle_or_work && roam_trigger {
-            self.begin_roam(music)
-        } else if base == State::Idle && self.idle_ticks >= self.cfg.curious_after {
-            State::Curious
-        } else if base == State::Working && self.working_ticks >= self.cfg.coffee_after {
-            State::WorkingEmpty
         } else {
-            base
+            mood
         };
 
         if effective != self.animator.state {
@@ -399,13 +477,19 @@ impl LinuxPal {
     }
 
     /// Act on a command from the control socket.
+    /// Force a state for FORCE_TICKS, suppressing the window-driven machine.
+    /// Single writer for the force channel (welcome-back, summon, set-state).
+    fn force(&mut self, s: State) {
+        self.force_state = Some(s);
+        self.force_ticks_left = FORCE_TICKS;
+    }
+
     fn handle_control(&mut self, ev: control::ControlEvent) {
         use control::ControlEvent::*;
         match ev {
             Summon => {
                 self.bubble.say("hi! ask me:  linuxpal-ctl ask \"...\"");
-                self.force_state = Some(State::Happy);
-                self.force_ticks_left = FORCE_TICKS;
+                self.force(State::Happy);
                 self.greet_ticks_left = 0; // don't let a pending greet stomp this
             }
             Say(msg) => self.bubble.say(&msg),
@@ -419,10 +503,7 @@ impl LinuxPal {
                 morning::run(self.bubble_tx.clone());
             }
             SetState(name) => match parse_state(&name) {
-                Some(s) => {
-                    self.force_state = Some(s);
-                    self.force_ticks_left = FORCE_TICKS;
-                }
+                Some(s) => self.force(s),
                 None => self.bubble.say(&format!("unknown state: {name}")),
             },
             Quit => {
@@ -559,24 +640,6 @@ impl LinuxPal {
         x
     }
 
-    /// Bounding box over all outputs (global coords).
-    fn union_bounds(&self) -> (i32, i32, i32, i32) {
-        if self.outputs.is_empty() {
-            return (0, 0, FALLBACK_W, FALLBACK_H);
-        }
-        let mut minx = i32::MAX;
-        let mut miny = i32::MAX;
-        let mut maxx = i32::MIN;
-        let mut maxy = i32::MIN;
-        for g in &self.outputs {
-            minx = minx.min(g.x);
-            miny = miny.min(g.y);
-            maxx = maxx.max(g.x + g.w);
-            maxy = maxy.max(g.y + g.h);
-        }
-        (minx, miny, maxx, maxy)
-    }
-
     /// Index of the output whose rect contains the global point, if any.
     fn output_at(&self, x: i32, y: i32) -> Option<usize> {
         self.outputs
@@ -591,13 +654,44 @@ impl LinuxPal {
         lo + (self.rand() % (hi - lo + 1) as u64) as i32
     }
 
-    /// Pick a random global target around the union box. Overshooting the
-    /// bounds a little (WALL_PAD) makes it occasionally head into a gap or off
-    /// an outer edge, which drives the wall vs doorway behavior.
+    /// Pick a random global target inside a real output — never a dead zone in
+    /// the union box (areas inside the bounding box no monitor covers, common
+    /// when screens differ in size/offset). x overshoots a chosen output's
+    /// left/right edge by WALL_PAD so it still bumps outer side walls and heads
+    /// toward a neighbor's overlap band; y stays strictly inside that output so
+    /// it never walks at a row no monitor covers.
     fn pick_walk_target(&mut self) {
-        let (minx, miny, maxx, maxy) = self.union_bounds();
-        self.target_x = self.rand_range(minx - WALL_PAD, maxx - SPRITE_W as i32 + WALL_PAD);
-        self.target_y = self.rand_range(miny - WALL_PAD, maxy - SPRITE_H as i32 + WALL_PAD);
+        if self.outputs.is_empty() {
+            self.target_x = self.rand_range(MARGIN, FALLBACK_W - SPRITE_W as i32);
+            self.target_y = self.rand_range(MARGIN, FALLBACK_H - SPRITE_H as i32);
+            return;
+        }
+        // global reachable x-range so the whole sprite stays on real screen.
+        // Overshoot (WALL_PAD) toward an interior seam still drives crossings,
+        // but it's clamped at the OUTER edges so the pet can't aim past them
+        // and bonk the outermost monitor edge repeatedly.
+        let min_x = self.outputs.iter().map(|o| o.x).min().unwrap_or(0);
+        let max_x = self
+            .outputs
+            .iter()
+            .map(|o| o.x + o.w)
+            .max()
+            .unwrap_or(FALLBACK_W);
+        let i = (self.rand() as usize) % self.outputs.len();
+        let g = &self.outputs[i];
+        let (gx, gy, gw, gh) = (g.x, g.y, g.w, g.h);
+        let lo = (gx - WALL_PAD).max(min_x);
+        let hi = (gx + (gw - SPRITE_W as i32) + WALL_PAD).min(max_x - SPRITE_W as i32);
+        self.target_x = self.rand_range(lo, hi.max(lo));
+        let yhi = gy + (gh - SPRITE_H as i32);
+        self.target_y = if yhi >= gy {
+            self.rand_range(gy, yhi)
+        } else {
+            // output shorter than the sprite — aim the center onto it, else the
+            // sprite center lands off-screen and output_at rejects every step
+            // into a perpetual wall-slide for the whole leg
+            gy + gh / 2 - SPRITE_H as i32 / 2
+        };
     }
 
     /// Push current global pos to the surface as TOP|LEFT margins.
@@ -663,23 +757,71 @@ impl LinuxPal {
         State::Walk(self.walk_dir)
     }
 
+    /// Mood from the main-screen context, minus roam: what the pet poses as and
+    /// what tips/jokes are generated for. music → Jamming, video → Cozy, long
+    /// work → WorkingEmpty, away/long-idle → Curious, else the base state.
+    fn mood_state(&self, base: &State, music: bool, video: bool) -> State {
+        if music {
+            State::Jamming
+        } else if video {
+            State::Cozy
+        } else if *base == State::Working && self.working_ticks >= self.cfg.coffee_after {
+            State::WorkingEmpty
+        } else if self.user_idle
+            || (*base == State::Idle && self.idle_ticks >= self.cfg.curious_after)
+        {
+            State::Curious
+        } else {
+            base.clone()
+        }
+    }
+
+    /// Pause mid-roam: stand in the LIVE main-screen mood and deliver a tip/joke
+    /// generated for that context, then the park branch resumes wandering. The
+    /// roam's one intentional, content-bearing stop (companion mode).
+    fn roam_tip(&mut self) {
+        let mood = self.roam_mood.clone();
+        let ctx = self.last_ctx.clone();
+        self.park_ticks_left = self.cfg.park_duration;
+        self.animator.state = mood.clone();
+        self.animator.reset();
+        self.bubble.show_loading();
+        llm::query_async(ctx, mood, self.bubble_tx.clone());
+    }
+
     /// One roam tick in global coords. Travels (walk frames) toward target; on
     /// arrival jams in place if music. Crossing a shared edge hops to the
     /// neighbor output (doorway); an outer edge is a wall — both get a comment.
     fn advance_walk(&mut self, music: bool, qh: &QueueHandle<Self>) {
-        // parked: jam in place, don't move the surface
+        // parked: hold the pose set when the pause began (Jamming for a music
+        // stop, Idle while a tip/joke shows). Don't move the surface.
         if self.park_ticks_left > 0 {
             self.park_ticks_left -= 1;
-            self.animator.state = State::Jamming;
             if self.park_ticks_left == 0 {
-                if music {
-                    self.pick_walk_target(); // next leg
-                } else {
+                // pause over → resume wandering with a fresh leg + target
+                self.walk_ticks_left = self.cfg.walk_duration;
+                self.pick_walk_target();
+                if !self.cfg.always_roam && !music {
                     self.stop_roam(false); // music ended while parked
                 }
             }
             return;
         }
+
+        // leg timer governs non-music roam length. Tick at the top so every tick
+        // counts even while sliding along a wall (the wall branch returns early).
+        if !music {
+            self.walk_ticks_left = self.walk_ticks_left.saturating_sub(1);
+            if self.walk_ticks_left == 0 {
+                if self.cfg.always_roam {
+                    self.roam_tip(); // pause, deliver a tip/joke, then resume
+                    return;
+                }
+                self.stop_roam(false);
+                return;
+            }
+        }
+        self.wall_cooldown = self.wall_cooldown.saturating_sub(1);
 
         let walk_step = self.cfg.walk_step;
         let step_axis = |cur: i32, target: i32| -> i32 {
@@ -706,6 +848,10 @@ impl LinuxPal {
         // mascot is flush-right in the surface → its centre, not the surface centre
         let cx = nx + SPRITE_W as i32 - MASCOT_W / 2;
         let cy = ny + SPRITE_H as i32 / 2;
+        // "keep current axis" centers — let the wall branch test sliding one
+        // axis at a time (move x while holding y, or vice versa)
+        let cx_keep = self.pos_x + SPRITE_W as i32 - MASCOT_W / 2;
+        let cy_keep = self.pos_y + SPRITE_H as i32 / 2;
 
         match self.output_at(cx, cy) {
             Some(i) if i == self.cur_idx => {
@@ -713,6 +859,7 @@ impl LinuxPal {
                 self.pos_x = nx;
                 self.pos_y = ny;
                 self.apply_margins();
+                self.wall_ticks = 0; // clean step clears any wall-slide streak
             }
             Some(i) => {
                 // sprite center crossed into a neighbor — hop screens
@@ -721,15 +868,35 @@ impl LinuxPal {
                 log::info!("cross → output {i}");
                 self.bubble.say(CROSS_MSG);
                 self.pin_to(i, qh);
+                self.wall_ticks = 0;
             }
             None => {
-                // would leave all screens → outer wall
-                self.bubble.say(WALL_MSG);
-                self.pos_x = nx;
-                self.pos_y = ny;
+                // diagonal step would leave every screen. Don't bounce off
+                // randomly — slide along whichever axis keeps the center on the
+                // current output, so it can reach a neighbor's overlap band
+                // (doorway). A true corner pins it until the slide budget runs
+                // out, then it repicks.
+                let x_ok = self.output_at(cx, cy_keep) == Some(self.cur_idx);
+                let y_ok = self.output_at(cx_keep, cy) == Some(self.cur_idx);
+                if x_ok {
+                    self.pos_x = nx;
+                }
+                if y_ok {
+                    self.pos_y = ny;
+                }
                 self.clamp_to_cur();
                 self.apply_margins();
-                self.pick_walk_target(); // turn around, head elsewhere
+                self.wall_ticks += 1;
+
+                if self.wall_cooldown == 0 {
+                    self.bubble.say(WALL_MSG);
+                    self.wall_cooldown = WALL_COOLDOWN;
+                }
+                if self.wall_ticks >= WALL_SLIDE_MAX {
+                    self.wall_ticks = 0;
+                    log::info!("wall edge at ({},{}) — repick", self.pos_x, self.pos_y);
+                    self.pick_walk_target(); // give up this target, head elsewhere
+                }
                 return;
             }
         }
@@ -741,14 +908,6 @@ impl LinuxPal {
                 self.animator.state = State::Jamming;
             } else {
                 self.pick_walk_target();
-            }
-        }
-
-        // session timer governs non-music roam length only
-        if !music {
-            self.walk_ticks_left = self.walk_ticks_left.saturating_sub(1);
-            if self.walk_ticks_left == 0 {
-                self.stop_roam(false);
             }
         }
     }
@@ -948,6 +1107,7 @@ impl PointerHandler for LinuxPal {
                 }
                 PointerEventKind::Leave { .. } => {
                     self.press = None;
+                    self.pointer_pos = (-1.0, -1.0); // cursor gone → ease lean back
                 }
                 PointerEventKind::Motion { .. } => {
                     self.pointer_pos = event.position;
@@ -1075,6 +1235,50 @@ delegate_pointer!(LinuxPal);
 delegate_keyboard!(LinuxPal);
 delegate_registry!(LinuxPal);
 
+// ext-idle-notify-v1 lives outside sctk's delegate macros, so wire its two
+// objects by hand. The notifier has no events; the notification fires
+// idled/resumed, which drive away-detection + the welcome-back greeting.
+impl Dispatch<ExtIdleNotifierV1, ()> for LinuxPal {
+    fn event(
+        _: &mut Self,
+        _: &ExtIdleNotifierV1,
+        _: ext_idle_notifier_v1::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+    }
+}
+
+impl Dispatch<ExtIdleNotificationV1, ()> for LinuxPal {
+    fn event(
+        state: &mut Self,
+        _: &ExtIdleNotificationV1,
+        event: ext_idle_notification_v1::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        match event {
+            ext_idle_notification_v1::Event::Idled => {
+                state.user_idle = true;
+                log::info!("user idle (away)");
+            }
+            ext_idle_notification_v1::Event::Resumed => {
+                // only a genuine away→back transition triggers welcome-back;
+                // a Resumed with no prior Idled (some compositors emit one at
+                // arm time) must not fire a spurious greeting on startup
+                if state.user_idle {
+                    state.idle_returned = true;
+                }
+                state.user_idle = false;
+                log::info!("user resumed (back)");
+            }
+            _ => {}
+        }
+    }
+}
+
 /// Action-menu panel left-x: anchored just left of the mascot (which blits
 /// flush-right, nominal left `SPRITE_W - MASCOT_W`). Stable across animation
 /// frames so draw and hit-test agree.
@@ -1150,6 +1354,12 @@ fn main() {
     let compositor = CompositorState::bind(&globals, &qh).expect("wl_compositor not available");
     let layer_shell = LayerShell::bind(&globals, &qh).expect("wlr-layer-shell not available");
     let shm = Shm::bind(&globals, &qh).expect("wl_shm not available");
+    // optional: real input-idle. Absent on non-supporting compositors → feature
+    // just stays off (notifier None).
+    let idle_notifier = globals
+        .bind::<ExtIdleNotifierV1, _, _>(&qh, 1..=2, ())
+        .map_err(|e| log::warn!("ext-idle-notify unavailable, idle detection off: {e}"))
+        .ok();
 
     let surface = compositor.create_surface(&qh);
     let layer_surface =
@@ -1185,7 +1395,8 @@ fn main() {
         width: SPRITE_W,
         height: SPRITE_H,
         press: None,
-        pointer_pos: (0.0, 0.0),
+        pointer_pos: (-1.0, -1.0),
+        lean_px: 0,
         menu_open: false,
         keyboard: None,
         input_mode: false,
@@ -1196,10 +1407,18 @@ fn main() {
         working_ticks: 0,
         stable_ticks: 0,
         last_base: None,
+        roam_mood: State::Idle,
+        last_ctx: String::new(),
         roaming: false,
         walk_ticks_left: 0,
         park_ticks_left: 0,
         walk_dir: Direction::Right,
+        wall_cooldown: 0,
+        wall_ticks: 0,
+        idle_notifier,
+        idle_notification: None,
+        user_idle: false,
+        idle_returned: false,
         greet_ticks_left: GREET_TICKS,
         greeted: false,
         force_state: None,
