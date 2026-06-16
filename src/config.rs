@@ -9,8 +9,13 @@ use std::path::PathBuf;
 pub struct Config {
     /// Substring identifying the monitor that drives state on dual-screen setups.
     pub hdmi_match: String,
-    /// Ollama model for ambient tips + `ask`.
+    /// Local Ollama model for ambient tips/jokes + the `ask` fallback.
     pub model: String,
+    /// Gemini model used for `ask` (e.g. `gemini-flash-latest`).
+    pub gemini_model: String,
+    /// Gemini API key. Prefer the `GEMINI_API_KEY` env var; this is a fallback
+    /// kept out of tracked source (lives in the local config.toml only).
+    pub gemini_api_key: String,
     /// Startup greeting text.
     pub greet_msg: String,
     /// Idle ticks (10 = 1s) before going Curious.
@@ -43,6 +48,8 @@ impl Default for Config {
         Self {
             hdmi_match: "hdmi".into(),
             model: "qwen2.5:1.5b".into(),
+            gemini_model: "gemini-flash-latest".into(),
+            gemini_api_key: String::new(),
             greet_msg: "hello! lets get some ideas and tasks done!".into(),
             curious_after: 150,
             walk_every: 50,
@@ -73,8 +80,19 @@ const DEFAULT_TOML: &str = r#"# ~/.config/linuxpal/config.toml
 # Monitor that decides state on a dual-screen setup (substring of the name).
 hdmi_match = "hdmi"
 
-# Ollama model for ambient tips and the "ask" feature.
+# Local Ollama model for ambient tips/jokes (fire constantly) and as the `ask`
+# fallback. Cheap + unlimited; quality matters little for canned tips.
 model = "qwen2.5:1.5b"
+
+# Gemini model used for `ask` (rare, wants a good answer). `gemini-flash-latest`
+# tracks the newest flash; pin an exact id if you prefer (e.g. gemini-2.5-flash-lite
+# for a larger free-tier quota). Note: gemini-3.5-flash free tier is only 20/day.
+gemini_model = "gemini-flash-latest"
+
+# Gemini API key. Best practice: leave this blank and export GEMINI_API_KEY in
+# your shell instead. If set here, keep this file private (chmod 600); never
+# commit a real key. Get one at https://aistudio.google.com/apikey
+# gemini_api_key = ""
 
 # Greeting shown at launch.
 greet_msg = "hello! lets get some ideas and tasks done!"
@@ -133,6 +151,8 @@ fn apply(cfg: &mut Config, key: &str, val: &str) {
     match key {
         "hdmi_match" => cfg.hdmi_match = val.to_string(),
         "model" => cfg.model = val.to_string(),
+        "gemini_model" => cfg.gemini_model = val.to_string(),
+        "gemini_api_key" => cfg.gemini_api_key = val.to_string(),
         "greet_msg" => cfg.greet_msg = val.to_string(),
         "curious_after" => set(&mut cfg.curious_after, val),
         "walk_every" => set(&mut cfg.walk_every, val),

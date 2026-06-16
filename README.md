@@ -22,8 +22,9 @@ roams across your monitors, and speaks tips + jokes from a local LLM.
   walls (*"a wall here…"*).
 - **Music & video aware** — real playback via MPRIS (`playerctl`): music → dances, plain video →
   cozy. Scoped to the deciding window so off-screen audio can't hijack the mood.
-- **Local LLM** — speech bubble with a TIP + JOKE from Ollama; falls back to an offline bank if
-  Ollama is down.
+- **Two-model LLM** — ambient TIP + JOKE come from a local Ollama model (cheap, fires constantly;
+  offline bank if Ollama is down). `ask` uses the Gemini API for quality, falling back to the local
+  model if Gemini is unreachable or rate-limited.
 - **Ask anything** — `linuxpal-ctl ask "…"` streams a short answer into the bubble.
 - **Control socket** — summon, ask, force a mood, or run a routine from a Hyprland keybind or
   script.
@@ -56,7 +57,9 @@ roams across your monitors, and speaks tips + jokes from a local LLM.
 
 - **Hyprland** — window context via `hyprctl`
 - `playerctl` — playback detection (`mpv-mpris` too if you want mpv on MPRIS)
-- **Ollama** running locally — optional, for bubble tips
+- **Ollama** running locally — for bubble tips/jokes + `ask` fallback (offline bank if absent)
+- **Gemini API key** — optional, for the `ask` feature; set `GEMINI_API_KEY` or `gemini_api_key`
+  in config (get one at https://aistudio.google.com/apikey). Without it, `ask` uses Ollama.
 - Rust toolchain — to build
 
 ---
@@ -87,7 +90,9 @@ rebuild.
 | Key | Meaning | Default |
 |-----|---------|---------|
 | `hdmi_match` | monitor substring that decides state on dual screens | `"hdmi"` |
-| `model` | Ollama model for tips + ask | `"qwen2.5:1.5b"` |
+| `model` | local Ollama model for tips/jokes + ask fallback | `"qwen2.5:1.5b"` |
+| `gemini_model` | Gemini model for `ask` | `"gemini-flash-latest"` |
+| `gemini_api_key` | Gemini key (prefer `GEMINI_API_KEY` env var) | — |
 | `greet_msg` | startup greeting text | — |
 | `curious_after` | idle ticks before Curious | `150` |
 | `walk_every` | stable ticks before a roam starts | `50` |
@@ -181,7 +186,7 @@ wayland outputs (main.rs)─┘                                   │
 | `sprites.rs` | sprite loading + per-state frame timing (`Animator`) |
 | `main.rs` | layer-shell surface, tick state machine, global-coord roaming, monitor hop, drag, render |
 | `bubble.rs` / `renderer.rs` | speech bubble (bitmap font) + ARGB blitting |
-| `llm.rs` | async Ollama queries (tips + streamed answers) over one bubble channel |
+| `llm.rs` | async LLM queries: local Ollama tips + Gemini/Ollama streamed `ask` over one bubble channel |
 | `control.rs` | Unix control socket → `ControlEvent`s; single entry for external triggers |
 | `morning.rs` | reads `morning.toml`, launches daily apps |
 

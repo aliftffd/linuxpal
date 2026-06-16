@@ -1323,6 +1323,8 @@ fn main() {
     // user config (~/.config/linuxpal/config.toml) — written with defaults on first run
     let cfg = config::load();
     llm::set_model(cfg.model.clone());
+    llm::set_gemini_model(cfg.gemini_model.clone());
+    llm::set_api_key(cfg.gemini_api_key.clone());
 
     let asset_dir =
         std::env::var("LINUXPAL_ASSETS").unwrap_or_else(|_| "assets/sprites".to_string());
