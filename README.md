@@ -1,7 +1,7 @@
 # LinuxPal
 
-A tiny pixel-art desktop mascot for **Hyprland / Wayland**. It lives on your screen as a
-`wlr-layer-shell` overlay, reads what you're doing (coding, browsing, watching, listening),
+A tiny pixel-art desktop mascot for **Hyprland / Wayland** (and **GNOME Shell / Mutter**). It lives on your screen as a
+`wlr-layer-shell` overlay (falling back to a borderless `xdg-shell` window on Mutter), reads what you're doing (coding, browsing, watching, listening),
 roams across your monitors, and speaks tips + jokes from a local LLM.
 
 <p align="center">
@@ -54,7 +54,9 @@ roams across your monitors, and speaks tips + jokes from a local LLM.
 
 ## Requirements
 
-- **Hyprland** — window context via `hyprctl`
+- **Wayland Compositor**:
+  - **Hyprland**: Native support via `hyprctl`.
+  - **GNOME Shell / Mutter**: Supported via a borderless `xdg-shell` fallback window. For active window context tracking, you will need to install a GNOME Shell extension like [Focused Window D-Bus](https://extensions.gnome.org/extension/5592/focused-window-d-bus/) or [Window Calls Extended](https://extensions.gnome.org/extension/4862/activate-window-by-title/).
 - `playerctl` — playback detection (`mpv-mpris` too if you want mpv on MPRIS)
 - **Ollama** running locally — optional, for bubble tips
 - Rust toolchain — to build
@@ -68,7 +70,7 @@ roams across your monitors, and speaks tips + jokes from a local LLM.
 ```
 
 Builds release, installs `linuxpal` + `linuxpal-ctl` + `linuxpal-toggle` to `~/.local/bin`,
-sprites to `~/.local/share/linuxpal/sprites/`, and adds the Hyprland autostart entry once. Re-run
+sprites to `~/.local/share/linuxpal/sprites/`, and configures autostart (either via Hyprland's `Startup_Apps.conf` or a standard `.desktop` file in `~/.config/autostart/` for GNOME/Mutter). Re-run
 after any change.
 
 Run without installing:
