@@ -31,8 +31,10 @@ use smithay_client_toolkit::{
             Anchor, KeyboardInteractivity, Layer, LayerShell, LayerShellHandler, LayerSurface,
             LayerSurfaceConfigure,
         },
+        xdg::window::{Window, WindowConfigure, WindowDecorations, WindowHandler},
         WaylandSurface,
     },
+    delegate_xdg_shell, delegate_xdg_window,
     shm::{
         slot::{Buffer, SlotPool},
         Shm, ShmHandler,
@@ -43,6 +45,20 @@ use wayland_client::{
     protocol::{wl_keyboard, wl_output, wl_pointer, wl_seat, wl_shm, wl_surface},
     Connection, Dispatch, QueueHandle,
 };
+
+enum MascotSurface {
+    Layer(LayerSurface),
+    Xdg(Window),
+}
+
+impl WaylandSurface for MascotSurface {
+    fn wl_surface(&self) -> &wl_surface::WlSurface {
+        match self {
+            MascotSurface::Layer(s) => s.wl_surface(),
+            MascotSurface::Xdg(w) => w.wl_surface(),
+        }
+    }
+}
 use wayland_protocols::ext::idle_notify::v1::client::{
     ext_idle_notification_v1::{self, ExtIdleNotificationV1},
     ext_idle_notifier_v1::{self, ExtIdleNotifierV1},
@@ -96,22 +112,24 @@ struct Press {
     last: (f64, f64),  // last motion position, for incremental drag delta
     time: Instant,     // when it began, for the long-press threshold
     dragging: bool,    // promoted to a move once held long / moved far enough
+    serial: u32,
 }
 
 struct LinuxPal {
     registry_state: RegistryState,
     output_state: OutputState,
     compositor: CompositorState,
-    layer_shell: LayerShell,
+    layer_shell: Option<LayerShell>,
     shm: Shm,
     seat_state: SeatState,
 
     cfg: config::Config,
 
-    layer_surface: Option<LayerSurface>,
+    layer_surface: Option<MascotSurface>,
     pool: Option<SlotPool>,
     buffer: Option<Buffer>,
     pointer: Option<wl_pointer::WlPointer>,
+    seat: Option<wl_seat::WlSeat>,
 
     sprites: Sprites,
     animator: Animator,
@@ -194,7 +212,7 @@ struct LinuxPal {
 impl LinuxPal {
     fn draw(&mut self, _qh: &QueueHandle<Self>) {
         let surface = match &self.layer_surface {
-            Some(s) => s,
+            Some(s) => s.wl_surface(),
             None => return,
         };
         let pool = match &mut self.pool {
@@ -265,9 +283,9 @@ impl LinuxPal {
 
         renderer::blit_frame(canvas, w, h, stride, frame, x_offset);
 
-        surface.wl_surface().attach(Some(buffer.wl_buffer()), 0, 0);
-        surface.wl_surface().damage_buffer(0, 0, w as i32, h as i32);
-        surface.wl_surface().commit();
+        surface.attach(Some(buffer.wl_buffer()), 0, 0);
+        surface.damage_buffer(0, 0, w as i32, h as i32);
+        surface.commit();
 
         self.buffer = Some(buffer);
     }
@@ -521,7 +539,7 @@ impl LinuxPal {
             self.pos_x = g.x + self.margin_left;
             self.pos_y = g.y + self.margin_top;
         }
-        if let Some(surface) = &self.layer_surface {
+        if let Some(MascotSurface::Layer(surface)) = &self.layer_surface {
             surface.set_margin(self.margin_top, 0, 0, self.margin_left);
             surface.commit();
         }
@@ -552,7 +570,7 @@ impl LinuxPal {
         match action {
             Morning => morning::run(self.bubble_tx.clone()),
             Terminal => spawn_exec("kitty"),
-            Browser => spawn_exec("zen-browser"),
+            Browser => spawn_exec("zen-browser || xdg-open about:blank || brave-browser || firefox || google-chrome-stable"),
             Ask => self.begin_input(),
             Quit => std::process::exit(0),
         }
@@ -560,7 +578,7 @@ impl LinuxPal {
 
     /// Grab (or release) modal keyboard focus for in-surface typing.
     fn set_keyboard(&self, on: bool) {
-        if let Some(s) = &self.layer_surface {
+        if let Some(MascotSurface::Layer(s)) = &self.layer_surface {
             s.set_keyboard_interactivity(if on {
                 KeyboardInteractivity::Exclusive
             } else {
@@ -700,7 +718,7 @@ impl LinuxPal {
             self.margin_left = (self.pos_x - g.x).max(0);
             self.margin_top = (self.pos_y - g.y).max(0);
         }
-        if let Some(s) = &self.layer_surface {
+        if let Some(MascotSurface::Layer(s)) = &self.layer_surface {
             s.set_margin(self.margin_top, 0, 0, self.margin_left);
             s.commit();
         }
@@ -722,8 +740,12 @@ impl LinuxPal {
             Some(g) => g.output.clone(),
             None => return,
         };
+        let ls_state = match &self.layer_shell {
+            Some(ls) => ls,
+            None => return, // no-op on XDG shell
+        };
         let surface = self.compositor.create_surface(qh);
-        let ls = self.layer_shell.create_layer_surface(
+        let ls = ls_state.create_layer_surface(
             qh,
             surface,
             Layer::Overlay,
@@ -739,7 +761,7 @@ impl LinuxPal {
         ls.set_keyboard_interactivity(KeyboardInteractivity::None);
         ls.commit();
 
-        self.layer_surface = Some(ls);
+        self.layer_surface = Some(MascotSurface::Layer(ls));
         self.cur_idx = idx;
         self.margin_left = ml;
         self.margin_top = mt;
@@ -1041,6 +1063,7 @@ impl SeatHandler for LinuxPal {
         seat: wl_seat::WlSeat,
         capability: Capability,
     ) {
+        self.seat = Some(seat.clone());
         if capability == Capability::Pointer && self.pointer.is_none() {
             match self.seat_state.get_pointer(qh, &seat) {
                 Ok(p) => self.pointer = Some(p),
@@ -1089,12 +1112,13 @@ impl PointerHandler for LinuxPal {
     ) {
         for event in events {
             match event.kind {
-                PointerEventKind::Press { button, .. } if button == BTN_LEFT => {
+                PointerEventKind::Press { button, serial, .. } if button == BTN_LEFT => {
                     self.press = Some(Press {
                         start: event.position,
                         last: event.position,
                         time: Instant::now(),
                         dragging: false,
+                        serial,
                     });
                 }
                 PointerEventKind::Release { button, .. } if button == BTN_LEFT => {
@@ -1119,6 +1143,9 @@ impl PointerHandler for LinuxPal {
                         let ty = event.position.1 - p.start.1;
                         if !p.dragging && (tx * tx + ty * ty).sqrt() > DRAG_SLOP {
                             p.dragging = true;
+                            if let (Some(MascotSurface::Xdg(window)), Some(seat)) = (&self.layer_surface, &self.seat) {
+                                window.move_(seat, p.serial);
+                            }
                         }
                         if p.dragging {
                             delta = Some((event.position.0 - p.last.0, event.position.1 - p.last.1));
@@ -1126,7 +1153,9 @@ impl PointerHandler for LinuxPal {
                         p.last = event.position;
                     }
                     if let Some((dx, dy)) = delta {
-                        self.drag_by(dx, dy);
+                        if let Some(MascotSurface::Layer(_)) = &self.layer_surface {
+                            self.drag_by(dx, dy);
+                        }
                     }
                 }
                 _ => {}
@@ -1234,6 +1263,31 @@ delegate_seat!(LinuxPal);
 delegate_pointer!(LinuxPal);
 delegate_keyboard!(LinuxPal);
 delegate_registry!(LinuxPal);
+delegate_xdg_shell!(LinuxPal);
+delegate_xdg_window!(LinuxPal);
+
+impl WindowHandler for LinuxPal {
+    fn request_close(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &Window) {
+        std::process::exit(0);
+    }
+
+    fn configure(
+        &mut self,
+        _: &Connection,
+        qh: &QueueHandle<Self>,
+        _: &Window,
+        _configure: WindowConfigure,
+        _: u32,
+    ) {
+        if self.pool.is_none() {
+            let pool = SlotPool::new((self.width * self.height * 4 * 2) as usize, &self.shm)
+                .expect("failed to create slot pool");
+            self.pool = Some(pool);
+        }
+        self.configured = true;
+        self.draw(qh);
+    }
+}
 
 // ext-idle-notify-v1 lives outside sctk's delegate macros, so wire its two
 // objects by hand. The notifier has no events; the notification fires
@@ -1293,8 +1347,16 @@ fn menu_origin_x() -> usize {
 fn spawn_exec(cmd: &str) {
     let cmd = cmd.to_string();
     std::thread::spawn(move || {
-        let _ = std::process::Command::new("hyprctl")
+        if std::process::Command::new("hyprctl")
             .args(["dispatch", "exec", &cmd])
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+        {
+            return;
+        }
+        let _ = std::process::Command::new("sh")
+            .args(["-c", &cmd])
             .status();
     });
 }
@@ -1352,7 +1414,7 @@ fn main() {
     let qh = queue.handle();
 
     let compositor = CompositorState::bind(&globals, &qh).expect("wl_compositor not available");
-    let layer_shell = LayerShell::bind(&globals, &qh).expect("wlr-layer-shell not available");
+    let layer_shell = LayerShell::bind(&globals, &qh).ok();
     let shm = Shm::bind(&globals, &qh).expect("wl_shm not available");
     // optional: real input-idle. Absent on non-supporting compositors → feature
     // just stays off (notifier None).
@@ -1362,14 +1424,25 @@ fn main() {
         .ok();
 
     let surface = compositor.create_surface(&qh);
-    let layer_surface =
-        layer_shell.create_layer_surface(&qh, surface, Layer::Overlay, Some("linuxpal"), None);
-
-    layer_surface.set_anchor(Anchor::TOP | Anchor::LEFT);
-    layer_surface.set_size(SPRITE_W, SPRITE_H);
-    layer_surface.set_margin(MARGIN, 0, 0, MARGIN);
-    layer_surface.set_keyboard_interactivity(KeyboardInteractivity::None);
-    layer_surface.commit();
+    let layer_surface = if let Some(ref ls_state) = layer_shell {
+        let ls = ls_state.create_layer_surface(&qh, surface, Layer::Overlay, Some("linuxpal"), None);
+        ls.set_anchor(Anchor::TOP | Anchor::LEFT);
+        ls.set_size(SPRITE_W, SPRITE_H);
+        ls.set_margin(MARGIN, 0, 0, MARGIN);
+        ls.set_keyboard_interactivity(KeyboardInteractivity::None);
+        ls.commit();
+        MascotSurface::Layer(ls)
+    } else {
+        use smithay_client_toolkit::shell::xdg::XdgShell;
+        let xdg_shell = XdgShell::bind(&globals, &qh).expect("neither layer-shell nor xdg-shell is available");
+        let window = xdg_shell.create_window(surface, WindowDecorations::None, &qh);
+        window.set_title("linuxpal");
+        window.set_app_id("linuxpal");
+        window.set_min_size(Some((SPRITE_W, SPRITE_H)));
+        window.set_max_size(Some((SPRITE_W, SPRITE_H)));
+        window.commit();
+        MascotSurface::Xdg(window)
+    };
 
     let mut app = LinuxPal {
         registry_state: RegistryState::new(&globals),
@@ -1383,6 +1456,7 @@ fn main() {
         pool: None,
         buffer: None,
         pointer: None,
+        seat: None,
         sprites,
         animator,
         bubble: bubble::Bubble::new(),
